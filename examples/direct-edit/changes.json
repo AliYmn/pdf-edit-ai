@@ -1,0 +1,8 @@
+{
+  "operations": [
+    {"op": "replace_text", "page": 1, "search": "12 April 2024", "text": "19 April 2024"},
+    {"op": "replace_text", "page": 1, "search": "Yıldız Lojistik A.Ş.", "text": "Yıldız Lojistik ve Ticaret A.Ş."},
+    {"op": "replace_text", "page": 1, "search": "4.2M", "text": "4.35M", "align": "right"},
+    {"op": "replace_text", "page": 1, "search": "+10.5%", "text": "+14.5%", "align": "right"}
+  ]
+}

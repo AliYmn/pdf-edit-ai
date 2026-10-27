@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pdf-tool demo / scratch outputs
+examples/work/
+*_extract/
+*_pages/
+*_assets/
+comparison/

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Q1 2024 Performance Summary</title>
+<!--
+  Reconstruction of examples/original.pdf from `pdf-tool inspect` measurements.
+  All lengths in pt. Text blocks are positioned so the first baseline matches the
+  original: top = baseline - (line-height - size)/2 - 0.77*size (Helvetica ascent).
+-->
+<style>
+  @page { size: 595.28pt 841.89pt; margin: 0; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: Helvetica, Arial, "Nimbus Sans", sans-serif; color: #222222; }
+
+  .page { position: relative; width: 595.28pt; height: 841.89pt; overflow: hidden; break-after: page; }
+  .page:last-child { break-after: auto; }
+
+  /* header band: shape [0,0,595.28,70] #0f3d6e; logo img-6 at [56,17,92,53] */
+  .band { position: absolute; left: 0; top: 0; width: 595.28pt; height: 70pt; background: #0f3d6e; }
+  .logo { position: absolute; left: 56pt; top: 17pt; width: 36pt; height: 36pt; }
+  .brand { position: absolute; left: 104pt; top: 26.68pt; font-size: 16pt; line-height: 20pt; font-weight: bold; color: #ffffff; }
+  .tagline { position: absolute; right: 56pt; top: 32.3pt; font-size: 10pt; line-height: 12pt; color: #d9e6f7; }
+
+  /* footer: rule y=793.89 (0.6pt #bfc7d1), 8pt text baseline 807.89 */
+  .rule { position: absolute; left: 56pt; width: 483.28pt; top: 793.59pt; border-top: 0.6pt solid #bfc7d1; }
+  .foot { position: absolute; top: 800.73pt; font-size: 8pt; line-height: 10pt; color: #6b6b6b; }
+  .foot.left { left: 56pt; } .foot.right { right: 56pt; }
+
+  .content { position: absolute; left: 56pt; width: 483.28pt; }
+  h1 { margin: 0; font-size: 20pt; line-height: 24pt; font-weight: bold; color: #0f3d6e; }
+  .meta { margin: 3.7pt 0 0; font-size: 10pt; line-height: 14pt; color: #6b6b6b; }
+  h2 { margin: 0; font-size: 13pt; line-height: 16pt; font-weight: bold; color: #0f3d6e; }
+  p { margin: 0; padding: 0 1pt; font-size: 10.5pt; line-height: 14.7pt; text-align: justify; color: #222222; }
+  h2 + p, h2 + .slot { margin-top: 16.325pt; }
+  p + p { margin-top: 7.35pt; }
+  .slot { min-height: 99.675pt; }            /* overview slot: keeps section 2 where it was */
+
+  /* header fill painted once on the table: per-cell backgrounds leave hairline seams at fractional px */
+  table { border-collapse: collapse; width: 483.28pt; margin-top: 7.51pt; font-size: 9.5pt; color: #212121;
+          background: linear-gradient(#e8eef6, #e8eef6) top left / 100% 22pt no-repeat; }
+  col.c1 { width: 200pt; } col.c2, col.c3 { width: 95pt; } col.c4 { width: 93.28pt; }
+  th, td { height: 21pt; padding: 0 6pt; line-height: 21pt; text-align: right; font-weight: normal;
+           border-bottom: 0.75pt solid #b0bdcc; vertical-align: top; }
+  th { font-weight: bold; border-top: 0.75pt solid #b0bdcc; }
+  th:first-child, td:first-child { text-align: left; }
+  table + h2 { margin-top: 22.49pt; }
+
+  ul { list-style: none; margin: 5.675pt 0 0; padding: 0; }
+  li { position: relative; padding-left: 18pt; font-size: 10.5pt; line-height: 18pt; color: #212121; }
+  li::before { content: "•"; position: absolute; left: 4pt; color: #0f3d6e; }
+  ul + h2 { margin-top: 22.325pt; }
+</style>
+</head>
+<body>
+
+<section class="page">
+  <div class="band"></div>
+  <img class="logo" src="assets/images/img-6.png" alt="Northwind Analytics logo">
+  <div class="brand">Northwind Analytics</div>
+  <div class="tagline">Quarterly Business Review</div>
+
+  <div class="content" style="top: 94.6pt">
+    <h1>Q1 2024 Performance Summary</h1>
+    <div class="meta">Prepared for: Yıldız Lojistik ve Ticaret A.Ş.&nbsp; · &nbsp;Date: 19 April 2024</div>
+
+    <h2 style="margin-top: 20.19pt">1. Overview</h2>
+    <div class="slot">
+      <p>Northwind Analytics finished Q1 2024 ahead of plan: revenue rose in all three regions on the back of new
+      logistics customers in Istanbul and Ankara, operating costs stayed within budget, and churn reached a record low.</p>
+    </div>
+
+    <h2>2. Key Metrics</h2>
+    <table>
+      <colgroup><col class="c1"><col class="c2"><col class="c3"><col class="c4"></colgroup>
+      <tr><th>Metric</th><th>Q4 2023</th><th>Q1 2024</th><th>Change</th></tr>
+      <tr><td>Revenue (EUR)</td><td>3.8M</td><td>4.35M</td><td>+14.5%</td></tr>
+      <tr><td>Active customers</td><td>212</td><td>247</td><td>+16.5%</td></tr>
+      <tr><td>Platform utilisation</td><td>71%</td><td>78%</td><td>+7 pts</td></tr>
+      <tr><td>Monthly churn</td><td>2.1%</td><td>1.4%</td><td>-0.7 pts</td></tr>
+      <tr><td>Net Promoter Score</td><td>41</td><td>48</td><td>+7 pts</td></tr>
+    </table>
+
+    <h2>3. Outlook</h2>
+    <p>For the second quarter we expect continued growth as two enterprise contracts move from pilot to
+    production. Hiring will focus on data engineering, and the next platform release will add carbon
+    reporting for every delivery route.</p>
+    <p>In the third quarter Northwind will open a regional office in İzmir to serve customers along the Aegean
+    coast. The office will start with a team of eight and handle onboarding and support for western Türkiye.</p>
+  </div>
+
+  <div class="rule"></div>
+  <div class="foot left">Northwind Analytics · Confidential</div>
+  <div class="foot right">Page 1 of 2</div>
+</section>
+
+<section class="page">
+  <div class="band"></div>
+  <img class="logo" src="assets/images/img-6.png" alt="Northwind Analytics logo">
+  <div class="brand">Northwind Analytics</div>
+  <div class="tagline">Quarterly Business Review</div>
+
+  <div class="content" style="top: 100.49pt">
+    <h2>4. Risks</h2>
+    <ul>
+      <li>Fuel price volatility may compress customer margins and delay renewals.</li>
+      <li>Integration backlog with two ERP vendors could slow onboarding in Q2.</li>
+      <li>Currency movements (EUR/TRY) affect reported revenue from Turkish customers.</li>
+    </ul>
+    <h2>5. Next Steps</h2>
+    <p>The leadership team will review the hiring plan in May and present the carbon-reporting roadmap to
+    key customers in June. A detailed budget update will follow with the half-year report.</p>
+  </div>
+
+  <div class="rule"></div>
+  <div class="foot left">Northwind Analytics · Confidential</div>
+  <div class="foot right">Page 2 of 2</div>
+</section>
+
+</body>
+</html>

@@ -1,0 +1,212 @@
+"""Font resolution for edits: original embedded font -> system font -> built-in.
+
+Every candidate is checked for glyph coverage of the text to be written, so a
+missing glyph never silently turns into a substituted font.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from functools import cache
+from pathlib import Path
+
+import pymupdf
+
+from .common import PdfToolError, strip_subset
+
+SYSTEM_FONT_DIRS = [
+    "/System/Library/Fonts",
+    "/System/Library/Fonts/Supplemental",
+    "/Library/Fonts",
+    "~/Library/Fonts",
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "~/.fonts",
+    "~/.local/share/fonts",
+    "C:/Windows/Fonts",
+]
+# PDF base names -> common metric-compatible system family
+ALIASES = {
+    "helvetica": "arial",
+    "arialmt": "arial",
+    "times": "timesnewroman",
+    "timesroman": "timesnewroman",
+    "courier": "couriernew",
+    "liberationsans": "arial",
+    "liberationserif": "timesnewroman",
+}
+STYLE_WORDS = (
+    "bolditalic", "boldoblique", "semibold", "demibold", "extrabold", "bold", "italic", "oblique",
+    "regular", "roman", "book", "medium", "normal",
+)  # fmt: skip
+BUILTIN = {
+    "sans": ("helv", "hebo", "heit", "hebi"),
+    "serif": ("tiro", "tibo", "tiit", "tibi"),
+    "mono": ("cour", "cobo", "coit", "cobi"),
+}
+GENERIC_CSS = {"sans": "sans-serif", "serif": "serif", "mono": "monospace"}
+
+
+def norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def split_font_name(name: str) -> tuple[str, bool, bool]:
+    """'ABCDEF+TimesNewRomanPS-BoldItalicMT' -> ('timesnewroman', True, True)."""
+    n = strip_subset(name)
+    family, _, style = re.sub(r",", "-", n).partition("-")
+    family = re.sub(r"(PSMT|PS|MT)$", "", family)
+    style = re.sub(r"(PSMT|PS|MT)$", "", style)
+    fam, st = norm_name(family), norm_name(style)
+    changed = True
+    while changed:
+        changed = False
+        for w in STYLE_WORDS:
+            if fam.endswith(w) and len(fam) > len(w) + 2:
+                fam, st, changed = fam[: -len(w)], w + st, True
+    bold = any(w in st for w in ("bold", "black", "heavy", "semibold", "demi"))
+    italic = "italic" in st or "oblique" in st
+    return fam, bold, italic
+
+
+def font_class(family: str, serif: bool = False, mono: bool = False) -> str:
+    if mono or any(w in family for w in ("courier", "mono", "consol", "menlo", "code")):
+        return "mono"
+    if serif or any(w in family for w in ("times", "serif", "georgia", "garamond", "roman", "book", "minion", "cambria")):
+        return "serif" if "sans" not in family else "sans"
+    return "sans"
+
+
+@cache
+def _font_index(extra_dirs: tuple[str, ...]) -> dict[str, Path]:
+    index: dict[str, Path] = {}
+    for d in (*extra_dirs, *SYSTEM_FONT_DIRS):
+        root = Path(os.path.expanduser(d))
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*"):
+            if p.suffix.lower() in (".ttf", ".otf") and p.is_file():
+                index.setdefault(norm_name(p.stem), p)
+    return index
+
+
+def system_font(family: str, bold: bool, italic: bool, extra_dirs: tuple[str, ...] = ()) -> Path | None:
+    fam = ALIASES.get(family, family)
+    if bold and italic:
+        styles = ["bolditalic", "boldoblique", "bi", "z"]
+    elif bold:
+        styles = ["bold", "bd", "b"]
+    elif italic:
+        styles = ["italic", "oblique", "i"]
+    else:
+        styles = ["", "regular", "roman", "book", "normal"]
+    index = _font_index(extra_dirs)
+    for st in styles:
+        if (p := index.get(fam + st)) is not None:
+            return p
+    return None
+
+
+@dataclass
+class ResolvedFont:
+    font: pymupdf.Font
+    label: str
+    source: str  # font_file | original-embedded | system | builtin
+    bold: bool
+    italic: bool
+    buffer: bytes | None = None
+    ext: str = "ttf"
+    generic: str | None = None  # CSS generic family for built-in fonts
+    warnings: list[str] = field(default_factory=list)
+
+
+def _missing(font: pymupdf.Font, text: str) -> list[str]:
+    return sorted({c for c in text if not c.isspace() and not font.has_glyph(ord(c))})
+
+
+def embedded_fonts(doc: pymupdf.Document, page: pymupdf.Page) -> dict[str, tuple[int, str, bytes]]:
+    """Embedded font programs on a page, keyed by normalized BaseFont (no subset
+    prefix) and by the font program's own name (closer to what spans report)."""
+    out: dict[str, tuple[int, str, bytes]] = {}
+    for xref, ext, _t, basefont, *_ in page.get_fonts(full=True):
+        if ext == "n/a":
+            continue
+        try:
+            _, fext, _, buf = doc.extract_font(xref)
+        except Exception:
+            continue
+        if not buf:
+            continue
+        out.setdefault(norm_name(strip_subset(basefont)), (xref, fext, buf))
+        try:
+            out.setdefault(norm_name(pymupdf.Font(fontbuffer=buf).name), (xref, fext, buf))
+        except Exception:
+            pass
+    return out
+
+
+def resolve_font(
+    doc: pymupdf.Document,
+    page: pymupdf.Page,
+    text: str,
+    original: str | None = None,
+    family: str | None = None,
+    font_file: str | None = None,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    serif: bool = False,
+    mono: bool = False,
+    font_dirs: tuple[str, ...] = (),
+) -> ResolvedFont:
+    notes: list[str] = []
+    name = family or original or "Helvetica"
+    fam, name_bold, name_italic = split_font_name(name)
+    want_bold = name_bold if bold is None else bold
+    want_italic = name_italic if italic is None else italic
+
+    if font_file:
+        p = Path(font_file)
+        if not p.is_file():
+            raise PdfToolError(f"font_file not found: {p}")
+        f = pymupdf.Font(fontfile=str(p))
+        if miss := _missing(f, text):
+            raise PdfToolError(f"font_file {p.name} has no glyphs for {''.join(miss)!r}")
+        return ResolvedFont(f, f.name, "font_file", want_bold, want_italic, p.read_bytes(), p.suffix.lstrip(".").lower())
+
+    if original and not family:
+        emb = embedded_fonts(doc, page).get(norm_name(original))
+        if emb:
+            _, ext, buf = emb
+            f = pymupdf.Font(fontbuffer=buf)
+            miss = _missing(f, text)
+            if not miss:
+                return ResolvedFont(f, original, "original-embedded", want_bold, want_italic, buf, ext)
+            notes.append(f"embedded '{original}' lacks glyphs for {''.join(miss)!r} (subset font or no cmap)")
+        else:
+            notes.append(f"'{original}' is not embedded or not extractable")
+
+    path = system_font(fam, want_bold, want_italic, font_dirs)
+    if path:
+        try:
+            f = pymupdf.Font(fontfile=str(path))
+            miss = _missing(f, text)
+            if not miss:
+                if original and norm_name(original) != norm_name(f.name):
+                    notes.append(f"using system font {path.name} for '{original}'")
+                return ResolvedFont(f, f.name, "system", want_bold, want_italic, path.read_bytes(), path.suffix.lstrip(".").lower(), warnings=notes)
+            notes.append(f"system font {path.name} lacks glyphs for {''.join(miss)!r}")
+        except Exception as exc:
+            notes.append(f"cannot load {path}: {exc}")
+
+    cls = font_class(fam, serif, mono)
+    code = BUILTIN[cls][(2 if want_italic else 0) + (1 if want_bold else 0)]
+    f = pymupdf.Font(code)
+    if miss := _missing(f, text):
+        raise PdfToolError(
+            f"no available font covers {''.join(miss)!r}; provide font_file (or font_dirs) with a suitable font. "
+            + "; ".join(notes)
+        )
+    notes.append(f"substituted built-in {f.name} ({cls}) for '{name}'")
+    return ResolvedFont(f, f.name, "builtin", want_bold, want_italic, generic=GENERIC_CSS[cls], warnings=notes)

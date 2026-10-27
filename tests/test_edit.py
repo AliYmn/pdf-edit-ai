@@ -4,6 +4,7 @@ import pymupdf
 import pytest
 
 from conftest import squash, text_of
+from pdf_tools.compare import compare_pdfs, load_masks
 from pdf_tools.edit import ChangeSet, EditError, apply_edits, load_changes
 from pdf_tools.models import InputError
 from samples import new_image
@@ -77,16 +78,20 @@ def test_replace_turkish_text(pdfs, tmp_path):
 
 
 def test_replace_paragraph_rect_reflows_on_original_baseline(pdfs, tmp_path):
-    new = "Yeni paragraf: şirketin büyüme stratejisi ikinci yarıda güncellenmiştir. " * 3
+    new = "Yeni paragraf: şirketin büyüme stratejisi ikinci yarıda güncellenmiştir. " * 3 + "Traffic, financial office."  # ligature-prone
     rep = edit(pdfs["paragraph"], tmp_path, [{"op": "replace_text", "page": 1, "rect": [72, 95, 523, 200], "text": new}])
     assert rep.ok and rep.results[0].verified
     out = tmp_path / "out.pdf"
     assert squash(new) in squash(text_of(out))
     assert "quarterly report" not in text_of(out)
     assert "Next section starts here." in text_of(out)
-    first_before = line_with(pdfs["paragraph"], 1, "This quarterly")["spans"][0]["origin"][1]
-    first_after = line_with(out, 1, "Yeni paragraf")["spans"][0]["origin"][1]
-    assert first_after == pytest.approx(first_before, abs=0.6)
+    first_before = line_with(pdfs["paragraph"], 1, "This quarterly")["spans"][0]["origin"]
+    first_after = line_with(out, 1, "Yeni paragraf")["spans"][0]["origin"]
+    assert first_after[1] == pytest.approx(first_before[1], abs=0.05)  # same first baseline
+    with pymupdf.open(out) as doc:  # every line starts at the original left edge
+        starts = {round(ln["spans"][0]["origin"][0], 1) for b in doc[0].get_text("dict")["blocks"] for ln in b.get("lines", [])
+                  if 100 < ln["bbox"][1] < 200}  # fmt: skip
+    assert starts == {round(first_before[0], 1)}
 
 
 def test_replace_paragraph_overflow_fails_without_output(pdfs, tmp_path):
@@ -174,3 +179,54 @@ def test_table_cell_edit_respects_cell_border(pdfs, tmp_path):
         edit(pdfs["table"], tmp_path, ops)
     rep = edit(pdfs["table"], tmp_path, [{"op": "replace_text", "page": 1, "search": "North", "text": "Kuzey"}])
     assert rep.ok and "Kuzey" in text_of(tmp_path / "out.pdf")
+
+
+def test_remove_image_deletes_only_this_placement(pdfs, tmp_path):
+    with pymupdf.open(pdfs["images"]) as doc:
+        logo_xref = next(i["xref"] for i in doc[0].get_image_info(xrefs=True) if i["width"] == 240)
+    rep = edit(pdfs["images"], tmp_path, [{"op": "remove_image", "page": 1, "asset_id": f"img-{logo_xref}"}])
+    assert rep.ok and rep.results[0].verified
+    with pymupdf.open(tmp_path / "out.pdf") as doc:
+        assert [i["width"] for i in doc[0].get_image_info()] == [320]  # photo stays, logo gone
+        assert [i["width"] for i in doc[1].get_image_info()] == [240]  # shared logo kept on page 2
+        assert doc[0].get_pixmap(clip=pymupdf.Rect(100, 50, 101, 51)).pixel(0, 0) == (255, 255, 255)
+        assert "Product sheet page 1" in doc[0].get_text()
+
+
+def test_shorter_paragraph_then_shift_content_up(pdfs, tmp_path):
+    src = tmp_path / "linked.pdf"
+    with pymupdf.open(pdfs["paragraph"]) as doc:
+        doc[0].insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(72, 250, 190, 265), "uri": "https://example.com"})
+        doc.save(src)
+    rep = edit(src, tmp_path, [
+        {"op": "replace_text", "page": 1, "rect": [72, 95, 523, 200], "text": "One short line."},
+        {"op": "shift_content", "page": 1, "y": 220, "dy": -40},
+    ])  # fmt: skip
+    assert rep.ok
+    assert rep.results[0].height_change == pytest.approx(-3 * 14.85, abs=0.1)  # 4 lines -> 1
+    out = tmp_path / "out.pdf"
+    before = line_with(src, 1, "Next section")["spans"][0]["origin"][1]
+    after = line_with(out, 1, "Next section")["spans"][0]["origin"][1]
+    assert after == pytest.approx(before - 40, abs=0.05)
+    assert line_with(out, 1, "Summary")["spans"][0]["origin"][1] == pytest.approx(80, abs=0.05)  # above y: unchanged
+    with pymupdf.open(out) as doc:
+        (link,) = doc[0].get_links()
+        assert link["uri"] == "https://example.com" and link["from"].y0 == pytest.approx(210, abs=0.1)
+    # the report tells compare about the intentional move: no false "moved"/"missing" findings
+    (tmp_path / "r.json").write_text(rep.model_dump_json(), encoding="utf-8")
+    masks, shifts = load_masks(tmp_path / "r.json")
+    assert shifts[0].dy == -40 and masks[0].candidate_rect
+    cmp = compare_pdfs(src, out, tmp_path / "cmp", masks=masks, shifts=shifts)
+    assert cmp.pages[0].moved_blocks == [] and cmp.document_missing_text == [] and cmp.document_added_text == []
+
+
+def test_shift_content_refuses_unsafe_moves(pdfs, tmp_path):
+    cases = [
+        ({"y": 130, "dy": -10}, "crosses"),                 # cuts through the paragraph (105-165)
+        ({"y": 220, "dy": -60}, "not empty"),               # paragraph still occupies 160-165
+        ({"y": 220, "dy": 700}, "off the page"),
+    ]  # fmt: skip
+    for args, msg in cases:
+        with pytest.raises(EditError, match=msg):
+            edit(pdfs["paragraph"], tmp_path, [{"op": "shift_content", "page": 1, **args}])
+    assert not (tmp_path / "out.pdf").exists()

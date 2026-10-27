@@ -55,7 +55,7 @@ Paths with spaces work. Existing files, including the input PDF, are never overw
 | `pdf-tool extract in.pdf --format markdown\|json\|html [-o dir]` | Marker extraction (headings, lists, tables, images, page-aware). PyMuPDF decides first whether OCR is needed (`--ocr auto\|force\|never`). Several PDFs per call reuse the loaded models. `--engine pymupdf` is a fast fallback that never OCRs. |
 | `pdf-tool render in.pdf --dpi 150 [-p 1-3] [-o dir]` | PNG per page (`page-001.png`, …). |
 | `pdf-tool assets in.pdf -o assets` | Images (original JPEG/PNG bytes when browser-usable, otherwise RGB(A) PNG), curved vector clusters (SVG + 300 dpi PNG), embedded font programs, all listed in `manifest.json` with ids, placements and an inferred role (`logo-candidate`, …). |
-| `pdf-tool edit in.pdf --changes changes.json -o out.pdf [--report r.json]` | In-place edits: `replace_text` (search within a line, or a paragraph `rect`), `insert_text` (point or box), `redact`, `replace_image`. Either every operation is applied or nothing is written. |
+| `pdf-tool edit in.pdf --changes changes.json -o out.pdf [--report r.json]` | In-place edits: `replace_text` (search within a line, or a paragraph `rect`), `insert_text` (point or box), `redact`, `replace_image`, `remove_image`, `shift_content` (move everything below a line up/down to close or open space). Either every operation is applied or nothing is written. |
 | `pdf-tool generate doc.html -o out.pdf [--size-from in.pdf \| --page-size A4] [--margin 20mm] [--header-template h.html] [--footer-template f.html]` | HTML/CSS to PDF with headless Chromium: print CSS, page breaks, backgrounds, local images and fonts, tables. Page JS is off, the network is blocked, and only files under the HTML's folder (or `--root`) are served. |
 | `pdf-tool compare ref.pdf cand.pdf -o dir [--masks r.json] [--mask 1:x0,y0,x1,y1] [--expect T] [--forbid T]` | Side-by-side and diff PNGs, per-page SSIM, changed pixels and changed regions, word-level text diffs (per page and across the whole document), text-block moves measured on baselines, page size/count checks, and overflow warnings. Exits `1` if an `--expect`/`--forbid` check fails. |
 
@@ -71,7 +71,9 @@ Paths with spaces work. Existing files, including the input PDF, are never overw
     {"op": "insert_text", "page": 1, "point": [56, 780], "text": "Onaylandı", "size": 9, "color": "#666666"},
     {"op": "insert_text", "page": 1, "rect": [56, 700, 300, 760], "html": "<b>Note:</b> draft"},
     {"op": "redact", "page": 3, "search": "Internal only", "fill": "#000000"},
-    {"op": "replace_image", "page": 1, "asset_id": "img-12", "image": "new-logo.png"}
+    {"op": "replace_image", "page": 1, "asset_id": "img-12", "image": "new-logo.png"},
+    {"op": "remove_image", "page": 1, "asset_id": "img-7"},
+    {"op": "shift_content", "page": 2, "y": 232, "dy": -21}
   ]
 }
 ```
@@ -84,8 +86,15 @@ How the edit engine behaves:
   that share a baseline and nearly touch are treated as one line. The rest of the line is re-set
   so spacing stays natural. `align: right|center` keeps the line's end or centre fixed. Use
   `occurrence: n` to target one match.
-- **Paragraph replacement (`rect`)** puts the new text on the original first baseline, with the
-  original line pitch, font, size and color. Alignment is inferred unless given.
+- **Paragraph replacement (`rect`)** puts the new text on the original first baseline and left
+  edge, with the original line pitch, font, size and color. Alignment is inferred unless given.
+  Plain text is set one glyph per character, without ligatures, so it stays searchable even with
+  subset fonts. The report's `height_change` says how much space the paragraph freed or needs.
+- **`shift_content`** re-places the page as two clipped copies, so text stays text, vectors stay
+  vectors, and links below the line move with the content. It runs after all other operations,
+  so coordinates always refer to the original page. It refuses to cut through content, to
+  overlap content, or to push content off the page. It is not supported on pages with
+  annotations or form fields.
 - **Fonts.** The original embedded font is reused if it has every glyph needed. Otherwise the tool
   tries a matching system font, then a built-in metric-compatible font (Helvetica/Times/Courier
   clones with Latin Extended, including Turkish). Each step is checked for glyph coverage, and the
@@ -94,9 +103,12 @@ How the edit engine behaves:
   to `min_scale`. `"allow"` writes anyway and warns. Lines are limited by paragraph width, table
   cell borders, neighbouring text and images, and the page's content margin.
 - **Image replacement** swaps every placement of a shared image object and keeps proportions
-  inside the original box.
-- **Verification.** After saving, every text operation is read back from the output
-  (`verified: true`), and the report's `masks` can be passed straight to `compare --masks`.
+  inside the original box. **Image removal** deletes the placement from the page's content
+  stream; the image data is dropped from the file when nothing else uses it.
+- **Verification.** After saving, every operation is checked against the output
+  (`verified: true`). The report's `masks` and `shifts` can be passed straight to
+  `compare --masks`: masks follow shifted content, and blocks moved exactly by an intended
+  shift are not flagged.
 
 ## Agent skill
 

@@ -132,7 +132,7 @@ def test_compare_detects_edits_and_masks_them(pdfs, tmp_path):
 
     masks_file = tmp_path / "report.json"
     masks_file.write_text(edit_rep.model_dump_json(), encoding="utf-8")
-    rep = compare_pdfs(pdfs["multipage"], tmp_path / "e.pdf", tmp_path / "c2", masks=load_masks(masks_file),
+    rep = compare_pdfs(pdfs["multipage"], tmp_path / "e.pdf", tmp_path / "c2", masks=load_masks(masks_file)[0],
                        expect=["June 2026"], forbid=["March 2024 (page 1)"])  # fmt: skip
     assert rep.pages[0].changed_pixels == 0 and rep.pages[0].masked_regions == 1
     assert rep.status == "ok" and all(e.ok for e in rep.expectations)

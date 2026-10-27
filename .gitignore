@@ -225,3 +225,5 @@ examples/work/
 *_pages/
 *_assets/
 comparison/
+# personal working files (never commit)
+pdf-work/

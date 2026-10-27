@@ -92,8 +92,9 @@ removed sections, new page...). Ask the user only if the request is genuinely am
 ### 6. Choose a strategy
 
 **Strategy A — direct edit (`pdf-tool edit`)** when every change is local:
-dates, names, numbers, labels, a short phrase, a paragraph rewritten to similar length,
-swapping a logo/image, redacting text. Untouched content stays byte-for-byte identical.
+dates, names, numbers, labels, a short phrase, a rewritten paragraph (shorter or longer —
+combine it with `shift_content` to close or open the space below), removing or swapping an
+image, redacting text. Untouched content stays byte-for-byte identical.
 
 **Strategy B — reconstruction (HTML/CSS → `pdf-tool generate`)** when changes alter structure:
 new or removed paragraphs/sections, tables gaining rows/columns, reordering, content that no
@@ -113,7 +114,9 @@ for body text) — switch that change to Strategy B.
     {"op": "replace_text", "page": 2, "rect": [56, 140, 539, 230], "text": "New paragraph ..."},
     {"op": "insert_text", "page": 1, "point": [56, 780], "text": "Approved", "size": 9, "color": "#666666"},
     {"op": "redact", "page": 3, "search": "Internal use only"},
-    {"op": "replace_image", "page": 1, "asset_id": "img-12", "image": "new-logo.png"}
+    {"op": "replace_image", "page": 1, "asset_id": "img-12", "image": "new-logo.png"},
+    {"op": "remove_image", "page": 1, "asset_id": "img-7"},
+    {"op": "shift_content", "page": 2, "y": 232, "dy": -21}
   ]
 }
 ```
@@ -134,7 +137,14 @@ Rules of the edit engine:
 - Text removal is real redaction (content removed, background kept). `redact` with
   `"fill": "#000000"` draws a black box; `remove_images` also blanks image pixels.
 - `replace_image` replaces every placement of a shared image object (e.g. a logo on all pages)
-  and keeps proportions inside the original box.
+  and keeps proportions inside the original box. `remove_image` deletes the image from this
+  page's content (background shows through; other pages keep a shared image).
+- `shift_content` moves everything at or below `y` by `dy` points (negative = up), keeping
+  text, vectors and links. It runs after all other operations, so every coordinate refers to
+  the original page. Pick `y` in an empty gap. It refuses when content crosses `y`, when moving
+  up would overlap content, or when moving down would push content off the page. A rect
+  `replace_text` reports `height_change` (e.g. `-21.0` = two 10.5 pt lines freed): run once
+  without the shift, read it, then add `shift_content` with `dy` = `height_change`.
 - Editing rotated pages is refused — use Strategy B.
 
 ```bash
@@ -142,6 +152,8 @@ Rules of the edit engine:
 ```
 
 If any operation fails, nothing is written and the JSON report explains why per operation.
+Check `verified` for every operation: `false` means the new text could not be read back
+(for example, ligatures a font cannot map), which matters for search and ATS parsing.
 
 ### 7–8B. Strategy B: rebuild as HTML/CSS and generate
 
@@ -207,7 +219,8 @@ Chromium may round page sizes by up to ~0.5 pt.
 Then **open** `comparison/side-by-side-NNN.png` and `comparison/diff-NNN.png` (red = changed,
 blue = masked) for every page and check them yourself. In `comparison/report.json` look at:
 - `document_missing_text` — reference text that disappeared anywhere (must be only what the
-  user asked to remove or replace),
+  user asked to remove or replace). With `--masks edit-report.json`, masks follow any
+  `shift_content` and blocks moved exactly by the intended shift are not reported,
 - per page: `changed_regions`, `moved_blocks` (dx/dy/dw/dh in pt), `missing_blocks`,
   `warnings` (text beyond page edge, overlapping text, text outside the reference margins,
   page-size differences, extra/missing pages, nearly empty last page),

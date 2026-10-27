@@ -32,8 +32,17 @@ DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES & ~pymupdf.T
 
 class Mask(BaseModel):
     page: int = Field(ge=1)
-    rect: BBox
+    rect: BBox = Field(description="Area in the reference")
+    candidate_rect: BBox | None = Field(None, description="Area in the candidate, if it differs")
     label: str = ""
+
+
+class Shift(BaseModel):
+    """Intentional move of everything at or below ``y`` (from `edit` shift_content)."""
+
+    page: int = Field(ge=1)
+    y: float
+    dy: float
 
 
 class BlockChange(BaseModel):
@@ -89,15 +98,17 @@ class ComparisonReport(BaseModel):
     pages: list[PageComparison]
 
 
-def load_masks(path: str | Path) -> list[Mask]:
+def load_masks(path: str | Path) -> tuple[list[Mask], list[Shift]]:
+    """Masks from a JSON list or an object with "masks" (an edit report also carries "shifts")."""
     p = Path(path)
     if not p.is_file():
         raise InputError(f"mask file not found: {p}")
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
+        shifts = [Shift.model_validate(x) for x in data.get("shifts", [])] if isinstance(data, dict) else []
         if isinstance(data, dict):
             data = data.get("masks", [])
-        return [Mask.model_validate(m) for m in data]
+        return [Mask.model_validate(m) for m in data], shifts
     except (json.JSONDecodeError, ValidationError) as exc:
         raise InputError(f"invalid mask file {p}: {exc}") from exc
 
@@ -227,7 +238,11 @@ def _blocks(page: pymupdf.Page, masks: list[pymupdf.Rect]) -> list[tuple[pymupdf
     return out
 
 
-def _match_blocks(ra, rb, tol: float):
+def _expected_dy(geom: tuple, shifts: list[Shift]) -> float:
+    return sum(sh.dy for sh in shifts if geom[1] >= sh.y)
+
+
+def _match_blocks(ra, rb, tol: float, shifts: list[Shift] = ()):
     moved, used = [], set()
     unmatched_a = []
     for rect_a, text_a, ga in ra:
@@ -248,7 +263,8 @@ def _match_blocks(ra, rb, tol: float):
             continue
         used.add(best_j)
         rect_b, _, gb = rb[best_j]
-        d = (gb[0] - ga[0], gb[1] - ga[1], (gb[2] - gb[0]) - (ga[2] - ga[0]), (gb[3] - gb[1]) - (ga[3] - ga[1]))
+        dy = gb[1] - ga[1] - _expected_dy(ga, shifts)  # intentional shifts are not regressions
+        d = (gb[0] - ga[0], dy, (gb[2] - gb[0]) - (ga[2] - ga[0]), (gb[3] - gb[1]) - (ga[3] - ga[1]))
         if max(abs(v) for v in d) > tol:
             moved.append(
                 BlockChange(text=text_a[:120], reference_bbox=rnd(rect_a), candidate_bbox=rnd(rect_b), dx=round(d[0], 2),
@@ -307,6 +323,7 @@ def compare_pdfs(
     out_dir: str | Path,
     dpi: int = 100,
     masks: list[Mask] | None = None,
+    shifts: list[Shift] | None = None,
     expect: list[str] | None = None,
     forbid: list[str] | None = None,
     tolerance: float = 2.0,
@@ -331,7 +348,9 @@ def compare_pdfs(
         for i in range(max(da.page_count, db.page_count)):
             pa = da[i] if i < da.page_count else None
             pb = db[i] if i < db.page_count else None
-            pm = [pymupdf.Rect(m.rect) for m in masks if m.page == i + 1]
+            pm = [pymupdf.Rect(m.rect) for m in masks if m.page == i + 1]  # reference side
+            cm = [pymupdf.Rect(m.candidate_rect or m.rect) for m in masks if m.page == i + 1]  # candidate side
+            psh = [sh for sh in shifts or [] if sh.page == i + 1]
             pc = PageComparison(page=i + 1, masked_regions=len(pm))
             img_a = _render(pa, dpi) if pa else None
             img_b = _render(pb, dpi) if pb else None
@@ -349,16 +368,16 @@ def compare_pdfs(
                     if img_b_cmp.shape != img_a.shape:  # off-by-one pixel rounding
                         img_b_cmp = cv2.resize(img_b, (img_a.shape[1], img_a.shape[0]), interpolation=cv2.INTER_AREA)
                 masks_px = [
-                    tuple(int(round(v / scale)) for v in (m.x0, m.y0, m.x1, m.y1)) for m in pm
+                    tuple(int(round(v / scale)) for v in (m.x0, m.y0, m.x1, m.y1)) for m in pm + cm
                 ]
                 masks_px = [(max(0, x0), max(0, y0), x1, y1) for x0, y0, x1, y1 in masks_px]
                 score, frac, regions, overlay = _pixel_compare(img_a, img_b_cmp, masks_px, scale)
                 pc.ssim, pc.changed_pixels, pc.changed_regions = round(score, 4), round(frac, 5), regions
                 pc.diff_image = _save(out / f"diff-{i + 1:03d}.png", overlay)
-                wa, wb = _words(pa, pm), _words(pb, pm)
+                wa, wb = _words(pa, pm), _words(pb, cm)
                 pc.missing_text, pc.added_text, pc.text_similarity = _phrases([w[4] for w in wa], [w[4] for w in wb])
                 pc.missing_text, pc.added_text = pc.missing_text[:MAX_ITEMS], pc.added_text[:MAX_ITEMS]
-                pc.moved_blocks, pc.missing_blocks, pc.added_blocks = _match_blocks(_blocks(pa, pm), _blocks(pb, pm), tolerance)
+                pc.moved_blocks, pc.missing_blocks, pc.added_blocks = _match_blocks(_blocks(pa, pm), _blocks(pb, cm), tolerance, psh)
             elif pa:
                 pc.warnings.append("page missing in candidate")
             else:
@@ -366,7 +385,7 @@ def compare_pdfs(
             if pa:
                 all_a += [w[4] for w in _words(pa, pm)]
             if pb:
-                all_b += [w[4] for w in _words(pb, pm)]
+                all_b += [w[4] for w in _words(pb, cm)]
             pc.side_by_side = _save(out / f"side-by-side-{i + 1:03d}.png", _side_by_side(img_a, img_b, i + 1))
             pages.append(pc)
         if pages and db.page_count > 1 and len(db[-1].get_text("words")) < 15 and len(da[-1].get_text("words")) >= 15:

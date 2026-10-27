@@ -128,7 +128,37 @@ class ReplaceImage(_Op):
         return self
 
 
-Operation = Annotated[ReplaceText | InsertText | Redact | ReplaceImage, Field(discriminator="op")]
+class RemoveImage(_Op):
+    op: Literal["remove_image"]
+    xref: int | None = None
+    asset_id: str | None = Field(None, description="Asset id from inspect/assets, e.g. 'img-12'")
+    rect: BBox | None = Field(None, description="Pick the image overlapping this area most")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if sum(x is not None for x in (self.xref, self.asset_id, self.rect)) != 1:
+            raise ValueError("remove_image needs exactly one of 'xref', 'asset_id' or 'rect'")
+        return self
+
+
+class ShiftContent(_Op):
+    """Move everything at or below ``y`` by ``dy`` points. Runs after all other
+    operations; coordinates always refer to the original page."""
+
+    op: Literal["shift_content"]
+    y: float = Field(gt=0, description="Content whose top is at or below this y moves")
+    dy: float = Field(description="Negative moves content up (closes space), positive moves it down")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if abs(self.dy) < 0.01:
+            raise ValueError("dy must not be 0")
+        return self
+
+
+Operation = Annotated[
+    ReplaceText | InsertText | Redact | ReplaceImage | RemoveImage | ShiftContent, Field(discriminator="op")
+]
 
 
 class ChangeSet(BaseModel):
@@ -146,7 +176,11 @@ class OpResult(BaseModel):
     font: str | None = None
     font_source: str | None = None
     scale: float | None = None
-    rects: list[BBox] = []
+    height_change: float | None = Field(
+        None, description="rect replace: new minus old text height in pt (pair with shift_content)"
+    )
+    rects: list[BBox] = Field([], description="Changed areas in the output")
+    reference_rects: list[BBox] = Field([], description="Matching areas in the input when they differ (rect replace)")
     verified: bool | None = None
     warnings: list[str] = []
 
@@ -157,6 +191,7 @@ class EditReport(BaseModel):
     ok: bool
     results: list[OpResult]
     masks: list[dict] = Field([], description="Changed areas; pass to `compare --masks`")
+    shifts: list[dict] = Field([], description="Intentional content moves; `compare --masks` expects them")
     warnings: list[str] = []
 
 
@@ -470,8 +505,63 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
             res.warnings.append(f"replacement scaled to {scale:.0%} to fit")
 
 
-def _html_from_text(text: str) -> str:
-    return htmllib.escape(text).replace("\n", "<br>")
+TEXT_ALIGN = {
+    "left": pymupdf.TEXT_ALIGN_LEFT,
+    "center": pymupdf.TEXT_ALIGN_CENTER,
+    "right": pymupdf.TEXT_ALIGN_RIGHT,
+    "justify": pymupdf.TEXT_ALIGN_JUSTIFY,
+}
+
+
+def _place_text(
+    page, box: pymupdf.Rect, first_baseline: float, text: str, rf: ResolvedFont, size: float, color: str,
+    pitch: float, align: str, op: _Style, res: OpResult,
+) -> tuple[pymupdf.Rect, float]:  # fmt: skip
+    """Wrap plain text into ``box`` starting exactly at ``first_baseline``.
+
+    Uses TextWriter (one glyph per character): MuPDF's HTML layout forms ligatures
+    that subset fonts cannot map back to Unicode, which breaks text extraction.
+    """
+    ratio = pitch / size
+
+    def layout(scale: float, target_page) -> tuple[pymupdf.TextWriter, float]:
+        fs = size * scale
+        base = box.y0 + (first_baseline - box.y0) * scale  # keep the line-box top fixed when shrinking
+        tw = pymupdf.TextWriter(target_page.rect)
+        # fill_textbox indents every line after the first by 0.2em; start the rect that much earlier
+        rect = pymupdf.Rect(box.x0 - 0.2 * fs, box.y0, box.x1, target_page.rect.y1)
+        over = tw.fill_textbox(rect, text, pos=(box.x0, base), font=rf.font, fontsize=fs, lineheight=ratio, align=TEXT_ALIGN[align])
+        if over:
+            raise PdfToolError("text runs past the bottom of the page")
+        lines = round((tw.last_point.y - base) / (pitch * scale)) + 1
+        return tw, lines * pitch * scale
+
+    scratch = pymupdf.open()
+    probe = scratch.new_page(width=page.rect.width, height=box.y0 + 10000)
+    scale = 1.0
+    _, needed = layout(1.0, probe)
+    used = needed
+    while used > box.height + 0.5:
+        if op.overflow == "shrink" and scale - 0.02 >= op.min_scale - 1e-9:
+            scale = round(scale - 0.02, 2)
+            _, used = layout(scale, probe)
+            continue
+        if op.overflow == "allow":
+            if box.y0 + used > page.rect.y1:
+                raise PdfToolError(f"text needs {used:.1f}pt height and would run off the page")
+            res.warnings.append(f"text extends {used - box.height:.1f}pt below the box; check for overlap")
+            break
+        hint = "Shorten the text, enlarge the rect, use overflow 'shrink', or reconstruct the document."
+        if op.overflow == "shrink":
+            raise PdfToolError(f"text does not fit even at {op.min_scale:.0%} scale (needs {needed:.1f}pt, box {box.height:.1f}pt)")
+        raise PdfToolError(f"text needs {needed:.1f}pt height but the box has {box.height:.1f}pt. {hint}")
+    scratch.close()
+    tw, used = layout(scale, page)
+    tw.write_text(page, color=_rgb(color))
+    if scale < 1:
+        res.scale = scale
+        res.warnings.append(f"text scaled to {scale:.0%} to fit")
+    return pymupdf.Rect(box.x0, box.y0, box.x1, box.y0 + used), used
 
 
 def _css(rf: ResolvedFont, size: float, color: str, line_ratio: float, align: str, arc_dir: Path) -> str:
@@ -533,7 +623,7 @@ def _place_html(
         if scale < 0.999:
             res.scale = round(scale, 3)
             res.warnings.append(f"text scaled to {scale:.0%} to fit")
-        return target
+        return target, min(needed, target.height) * scale
 
 
 def _infer_align(lines: list[pymupdf.Rect], box: pymupdf.Rect) -> str:
@@ -595,10 +685,17 @@ def _replace_rect(ctx: _Ctx, page, op: ReplaceText | InsertText, res: OpResult) 
     if is_replace and spans:
         _redact(page, [box], op.fill)
     top = (baselines[0] - BASELINE_RATIO * size - (line_ratio - 1) * size / 2) if baselines else box.y0
-    target = pymupdf.Rect(box.x0, top, box.x1, box.y1)
-    html = op.html if op.html is not None else _html_from_text(op.text or "")
-    placed = _place_html(ctx, page, target, html, rf, size, color, line_ratio, align, op, res)
-    res.rects.append(rnd(box | placed))
+    left = min(r.x0 for r in line_rects) if line_rects else box.x0  # the original text edge, not the rough rect
+    target = pymupdf.Rect(max(box.x0, left), top, box.x1, box.y1)
+    if op.text is not None:
+        first = baselines[0] if baselines else top + (line_ratio - 1) * size / 2 + BASELINE_RATIO * size
+        placed, used_h = _place_text(page, target, first, op.text, rf, size, color, pitch, align, op, res)
+    else:
+        placed, used_h = _place_html(ctx, page, target, op.html, rf, size, color, line_ratio, align, op, res)
+    res.rects.append(rnd(placed))
+    res.reference_rects.append(rnd(box))
+    if is_replace and baselines:
+        res.height_change = round(used_h - (baselines[-1] - baselines[0] + pitch), 2)
     res.font, res.font_source = rf.label, rf.source
 
 
@@ -693,6 +790,101 @@ def _replace_image(ctx: _Ctx, page, op: ReplaceImage, res: OpResult) -> None:
     res.message = f"replaced xref {xref}"
 
 
+def _remove_image(ctx: _Ctx, page, op: RemoveImage, res: OpResult) -> None:
+    """Delete image placements on this page (content-stream removal, not a cover-up)."""
+    infos = page.get_image_info(xrefs=True)
+    if op.rect is not None:
+        target = pymupdf.Rect(op.rect)
+        scored = [(abs(pymupdf.Rect(i["bbox"]) & target), k) for k, i in enumerate(infos)]
+        scored = [s for s in scored if s[0] > 0]
+        if not scored:
+            raise PdfToolError("no image overlaps rect")
+        chosen = [max(scored)[1]]
+    else:
+        xref = op.xref if op.xref is not None else _xref_from_asset(op.asset_id)
+        chosen = [k for k, i in enumerate(infos) if i["xref"] == xref]
+        if not chosen:
+            raise PdfToolError(f"image xref {xref} is not placed on page {op.page}")
+    for k in chosen:
+        box = pymupdf.Rect(infos[k]["bbox"]) & page.rect
+        if any(j not in chosen and pymupdf.Rect(i["bbox"]).intersects(box) for j, i in enumerate(infos)):
+            raise PdfToolError("another image overlaps this one; removing it would remove both")
+        w, h = box.width, box.height
+        page.add_redact_annot(box + (w / 4, h / 4, -w / 4, -h / 4), fill=False, cross_out=False)
+        res.rects.append(rnd(box))
+    page.apply_redactions(
+        images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+        graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+        text=pymupdf.PDF_REDACT_TEXT_NONE,
+    )
+
+
+def _shift_content(ctx: _Ctx, page, op: ShiftContent, res: OpResult) -> None:
+    """Re-place the page as two clipped copies: above ``y`` unchanged, below moved by ``dy``.
+
+    Text stays text, vectors stay vectors; links below ``y`` are moved too.
+    """
+    W, H = page.rect.width, page.rect.height
+    y, dy = op.y, op.dy
+    if y >= H:
+        raise PdfToolError(f"y={y} is outside the page")
+    if page.first_annot or page.first_widget:
+        raise PdfToolError("page has annotations or form fields, which would not move; shift_content is not supported")
+    drawings = page.get_drawings()
+    backgrounds = [d for d in drawings if d.get("fill") and not d.get("color") and d["rect"].width >= 0.9 * W]
+    content = [
+        pymupdf.Rect(ln["bbox"])
+        for b in page.get_text("dict", flags=RAW_FLAGS)["blocks"] if b["type"] == 0 for ln in b["lines"]
+    ]  # fmt: skip
+    content += [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()]
+    content += [d["rect"] for d in drawings if not any(d is b for b in backgrounds)]
+    crossing = [r for r in content if r.y0 < y - 0.5 and r.y1 > y + 0.5]
+    if crossing:
+        raise PdfToolError(f"content crosses y={y} (e.g. {rnd(crossing[0], 1)}); choose a y in an empty gap")
+    if dy < 0:
+        blocked = [r for r in content if r.y1 > y + dy + 0.5 and r.y0 < y - 0.5]
+        if blocked:
+            raise PdfToolError(f"the {-dy:.1f}pt above y={y} are not empty (e.g. {rnd(blocked[0], 1)}); content would overlap")
+    else:
+        below = [r.y1 for r in content if r.y0 >= y - 0.5]
+        if below and max(below) + dy > H:
+            raise PdfToolError(f"moving down {dy:.1f}pt pushes content off the page (lowest content at y={max(below):.1f})")
+
+    words_before = len(page.get_text("words"))
+    links = page.get_links()
+    src = pymupdf.open()
+    src.insert_pdf(ctx.doc, from_page=page.number, to_page=page.number)
+    empty = ctx.doc.get_new_xref()
+    ctx.doc.update_object(empty, "<<>>")
+    ctx.doc.update_stream(empty, b" ")
+    page.set_contents(empty)
+    for link in page.get_links():
+        page.delete_link(link)
+    gap = pymupdf.Rect(0, H + dy, W, H) if dy < 0 else pymupdf.Rect(0, y, W, y + dy)
+    fills = [d["fill"] for d in backgrounds if d["rect"].intersects(gap)]
+    if fills:  # the uncovered strip gets the page background colour
+        page.draw_rect(gap, color=None, fill=fills[-1], width=0)
+    top = pymupdf.Rect(0, 0, W, y + dy if dy < 0 else y)
+    page.show_pdf_page(top, src, 0, clip=top)
+    bottom_clip = pymupdf.Rect(0, y, W, H if dy < 0 else H - dy)
+    page.show_pdf_page(bottom_clip + (0, dy, 0, dy), src, 0, clip=bottom_clip)
+    src.close()
+    for link in links:
+        r = link["from"]
+        if r.y0 >= y - 0.5:
+            link = {**link, "from": r + (0, dy, 0, dy)}
+        page.insert_link(link)
+    try:
+        page.clean_contents(sanitize=True)  # drop resources no longer referenced by the page
+    except Exception:
+        pass
+    words_after = len(page.get_text("words"))
+    if words_after != words_before:
+        raise PdfToolError(f"internal check failed: {words_before} words before the shift, {words_after} after")
+    res.verified = True  # word count unchanged (checked above)
+    res.message = f"moved content below y={y:g} by {dy:+g}pt ({len(links)} links kept)"
+
+
 def _xref_from_asset(asset_id: str) -> int:
     m = re.fullmatch(r"img-(\d+)", asset_id or "")
     if not m:
@@ -714,6 +906,9 @@ def _verify(doc: pymupdf.Document, op, res: OpResult) -> None:
             res.verified = _squash(op.search) not in _squash(page.get_text("text"))
         else:
             res.verified = not page.get_text("text", clip=pymupdf.Rect(op.rect) + (1, 1, -1, -1)).strip()
+    elif isinstance(op, RemoveImage):
+        left = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()]
+        res.verified = not any(abs(r & pymupdf.Rect(b)) > 0.5 * abs(pymupdf.Rect(b)) for r in left for b in res.rects)
 
 
 def _dispatch(ctx: _Ctx, page, op, res: OpResult) -> None:
@@ -723,6 +918,10 @@ def _dispatch(ctx: _Ctx, page, op, res: OpResult) -> None:
         (_insert_point if op.point is not None else _replace_rect)(ctx, page, op, res)
     elif isinstance(op, Redact):
         _redact_op(ctx, page, op, res)
+    elif isinstance(op, RemoveImage):
+        _remove_image(ctx, page, op, res)
+    elif isinstance(op, ShiftContent):
+        _shift_content(ctx, page, op, res)
     else:
         _replace_image(ctx, page, op, res)
 
@@ -742,8 +941,11 @@ def apply_edits(
     doc = open_pdf(pdf)
     try:
         ctx = _Ctx(doc, base, tuple(str(Path(d).expanduser()) for d in cs.font_dirs))
-        results = []
-        for i, op in enumerate(cs.operations, 1):
+        results: list[OpResult] = []
+        # shifts run last so every other operation can use original-page coordinates
+        order = sorted(range(len(cs.operations)), key=lambda k: isinstance(cs.operations[k], ShiftContent))
+        for k in order:
+            op, i = cs.operations[k], k + 1
             res = OpResult(index=i, op=op.op, page=op.page, status="applied")
             try:
                 if op.page > doc.page_count:
@@ -755,6 +957,7 @@ def apply_edits(
             except PdfToolError as exc:
                 res.status, res.message = "failed", str(exc)
             results.append(res)
+        results.sort(key=lambda r: r.index)
         report = EditReport(source=str(pdf.resolve()), output=None, ok=all(r.status == "applied" for r in results), results=results)
         if not report.ok:
             raise EditError(report)
@@ -775,7 +978,18 @@ def apply_edits(
     finally:
         out_doc.close()
     report.output = str(output.resolve())
-    report.masks = [
-        {"page": r.page, "rect": rect, "label": f"op {r.index} {r.op}"} for r in report.results for rect in r.rects
-    ]
+    for r in report.results:
+        refs = r.reference_rects or r.rects
+        for ref, out in zip(refs, r.rects):
+            mask = {"page": r.page, "rect": ref, "label": f"op {r.index} {r.op}"}
+            if out != ref:
+                mask["candidate_rect"] = out
+            report.masks.append(mask)
+    for op in cs.operations:  # areas below a shift line sit elsewhere in the output
+        if isinstance(op, ShiftContent):
+            report.shifts.append({"page": op.page, "y": op.y, "dy": op.dy})
+            for m in report.masks:
+                out = m.get("candidate_rect", m["rect"])
+                if m["page"] == op.page and out[1] >= op.y - 0.5:
+                    m["candidate_rect"] = rnd(pymupdf.Rect(out) + (0, op.dy, 0, op.dy))
     return report

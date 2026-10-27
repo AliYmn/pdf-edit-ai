@@ -215,7 +215,7 @@ def compare(
     candidate: Annotated[Path, typer.Argument(help="Candidate (revised) PDF", dir_okay=False)],
     output: Annotated[Path, typer.Option("-o", "--output", help="Output directory")] = Path("comparison"),
     dpi: Annotated[int, typer.Option(help="Render resolution for pixel comparison")] = 100,
-    masks: Annotated[list[Path] | None, typer.Option("--masks", help="JSON masks (list, or an edit report)")] = None,
+    masks: Annotated[list[Path] | None, typer.Option("--masks", help="JSON masks (list, or an edit report incl. its shifts)")] = None,
     mask: Annotated[list[str] | None, typer.Option("--mask", help="PAGE:x0,y0,x1,y1 in points; repeatable")] = None,
     expect: Annotated[list[str] | None, typer.Option("--expect", help="Text that must appear; repeatable")] = None,
     forbid: Annotated[list[str] | None, typer.Option("--forbid", help="Text that must not appear; repeatable")] = None,
@@ -224,8 +224,13 @@ def compare(
     """Compare PDFs: side-by-side + diff images, metrics, text/bbox diffs, overflow warnings."""
     from .compare import compare_pdfs, load_masks, parse_mask
 
-    all_masks = [m for f in masks or [] for m in load_masks(f)] + [parse_mask(s) for s in mask or []]
-    rep = compare_pdfs(reference, candidate, output, dpi=dpi, masks=all_masks, expect=expect, forbid=forbid, tolerance=tolerance)
+    all_masks, shifts = [parse_mask(s) for s in mask or []], []
+    for f in masks or []:
+        file_masks, file_shifts = load_masks(f)
+        all_masks += file_masks
+        shifts += file_shifts
+    rep = compare_pdfs(reference, candidate, output, dpi=dpi, masks=all_masks, shifts=shifts, expect=expect,
+                       forbid=forbid, tolerance=tolerance)  # fmt: skip
     summary = {
         "status": rep.status,
         "report": str(output / "report.json"),

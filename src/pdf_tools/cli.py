@@ -18,7 +18,7 @@ from .models import InputError, PdfToolError
 
 app = typer.Typer(
     name="pdf-tool",
-    help="Local PDF toolkit for AI agents: inspect, extract, render, assets, edit, generate, compare.",
+    help="Local PDF toolkit for AI agents: inspect, extract, render, assets, edit, scaffold, generate, compare.",
     no_args_is_help=True,
     add_completion=False,
     pretty_exceptions_enable=False,
@@ -206,6 +206,20 @@ def generate(
         overwrite=overwrite, timeout_s=timeout,
     )  # fmt: skip
     typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+@app.command()
+@handle_errors
+def scaffold(
+    pdf: PdfArg,
+    output: Annotated[Path | None, typer.Option("-o", "--output", help="Output directory (default: <stem>_scaffold)")] = None,
+    pages: PagesOpt = None,
+    calibrate: Annotated[bool, typer.Option(help="Render, measure and correct baselines")] = True,
+) -> None:
+    """Write an editable HTML replica (index.html + fonts/images) as the start for reconstruction."""
+    from .scaffold import scaffold as run
+
+    typer.echo(json.dumps(run(pdf, output or Path(f"{pdf.stem}_scaffold"), pages=pages, calibrate=calibrate), indent=2, ensure_ascii=False))
 
 
 @app.command()

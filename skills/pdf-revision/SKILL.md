@@ -47,6 +47,7 @@ mkdir -p pdf-work/doc && cd pdf-work/doc
 - text: `text`, `typography` (font, size, color, bold, italic, `line_height` = baseline pitch),
   `lines[].spans[]` (exact `origin` baseline, font, size, color per run)
 - image: `asset_id`; table: `table.cells`, `cell_bboxes`; shape: `fill`, `stroke`, `stroke_width`
+- `pages[].links`: hyperlinks (`uri` or internal `target_page`) with their areas
 - `provenance`: `extracted` facts vs `inferred` heuristics (tables, reading order, background).
 - `fonts[]`: embedded/subset status and the sizes used.
 
@@ -72,8 +73,10 @@ hierarchy, table styling (borders, fills, alignment), list markers, colors, spac
 - `extract` decides OCR automatically: digital text layers skip OCR. Scanned pages use Marker OCR
   (needs `scripts/setup.sh --with-ocr`). `--engine pymupdf` is a fast fallback without Marker.
 - Marker page ids and `{N}----` separators are 0-based (page N+1).
-- `assets/manifest.json`: every image (`img-<xref>`), vector cluster (`vec-p<page>-<n>`, SVG + PNG)
-  and font with page placements and an inferred `role` (`logo-candidate`, `image`, ...).
+- `assets/manifest.json`: every image (`img-<xref>`), vector graphic (`vec-p<page>-<n>`: logos and
+  small icons as clean SVG built from the path data, plus a transparent PNG; identical icons are
+  one asset with several placements) and font, with page placements and an inferred `role`
+  (`logo-candidate`, `icon`, `image`, ...).
   Subset fonts contain only the glyphs used originally; `web_usable: false` fonts cannot be
   loaded with CSS `@font-face`.
 
@@ -121,13 +124,25 @@ for body text) — switch that change to Strategy B.
 }
 ```
 
+New content is given as exactly one of:
+- `"text"`: plain text. Styles are carried over **word by word** from the text it replaces:
+  unchanged words keep their style, a replaced word takes the style of the word it replaces,
+  inserted words continue the previous style. So `"Backend: Python, Django"` (bold label) →
+  `"Backend: Go, Rust"` keeps **Backend:** bold, and `"Infra: Docker"` → `"Platform: Nomad"`
+  makes **Platform:** bold. The report's `styled` field shows the result (`**bold**`, `_italic_`);
+  check it.
+- `"runs"`: explicit pieces, e.g. `[{"text": "Note:", "bold": true}, {"text": " details"}]`;
+  unset fields (bold, italic, color, size) follow the replaced text.
+- `"html"`: simple HTML: `<b>/<strong>`, `<i>/<em>`, `<br>`, `<p>`, `<span style="color:#…">`.
+Bold/italic pieces use the document's own embedded bold/italic font when it has one.
+
 Rules of the edit engine:
 - `search` mode works within one text line, whitespace-insensitive; `occurrence` picks the
   n-th match (default `all`). The rest of the line is shifted so spacing stays natural.
   `align`: `left` (keep start), `right` (keep end, e.g. numbers in right-aligned columns), `center`.
 - `rect` mode replaces all text inside the box (paragraph). New text is laid out on the
-  original first baseline with the original line pitch, font, size and color; alignment is
-  inferred unless given. `html` may replace `text` for simple inline formatting (`<b>`, `<i>`, `<br>`).
+  original first baseline and left edge with the original line pitch, fonts, sizes and colors;
+  hanging indents (bullets) are kept; alignment is inferred unless given.
 - Style overrides: `font`, `font_file`, `size`, `color`, `bold`, `italic`, `line_height` (pt).
 - Fonts: the original embedded font is reused when it has every needed glyph; otherwise a
   matching system font, then a built-in metric-compatible font. The report says which
@@ -157,8 +172,34 @@ Check `verified` for every operation: `false` means the new text could not be re
 
 ### 7–8B. Strategy B: rebuild as HTML/CSS and generate
 
-Build `revised.html` (with assets next to it) that mirrors the original. Do **not** pour
-Markdown into a generic template. Use the measured values:
+**Start from the scaffold** — an editable HTML replica of the original:
+
+```bash
+"$PDF_TOOL" scaffold /path/original.pdf -o rebuild        # rebuild/index.html + fonts/ images/ + scaffold.pdf
+```
+
+The scaffold renders itself, measures every text line against the original and corrects it;
+`scaffold.json` → `calibration` reports the remaining error (baselines are limited to Chromium's
+0.75 pt pixel grid). `rebuild/scaffold.pdf` is the untouched replica — compare it with the original
+first to see the baseline before your edits. In `index.html` (all lengths in pt, one
+`<section class="page">` per page):
+- every text line is a `<div class="l">` at its original position; styles are classes `.sN`;
+  edit words in place when the length stays similar,
+- a multi-line paragraph is wrapped in `<div class="block" data-class="sN" data-flow="…">`.
+  To rewrite it, replace the whole block with
+  `<p class="flow sN" style="{data-flow}">new text, <b>bold</b> allowed</p>` — it starts on the
+  original first baseline with the original width, line height, alignment and indent.
+  `data-flow-breaks="same"` means flowing text reproduces the original line breaks exactly,
+- shapes are `<div class="r">` (boxes, rules) and inline `<svg class="v">` (icons, curves),
+  images are `<img class="i">`, links are `<a href>` around their text,
+- to make room or close a gap, change the `top` of every element below that point by the same
+  amount (a short script over the `top:` values is the reliable way); remove an element to
+  delete it; copy and adjust an element to add a similar one (e.g. a table row),
+- fonts come from the PDF itself (`@font-face`); characters missing from a subset font fall back
+  to the system font named next in the family list — check `fonts` in the generate output.
+
+**Or write a new layout by hand** when the structure changes completely (new grid, many new
+sections). Do **not** pour Markdown into a generic template; mirror the measured values:
 
 ```html
 <!doctype html>
@@ -171,34 +212,22 @@ Markdown into a generic template. Use the measured values:
   .page { position: relative; width: 595.28pt; height: 841.89pt; overflow: hidden;
           padding: 56pt 56pt 64pt; page-break-after: always; }
   .page:last-child { page-break-after: auto; }
-  .band { position: absolute; left: 0; top: 0; width: 100%; height: 70pt; background: #0f3d6e; }
   h1 { font-size: 20pt; line-height: 24pt; font-weight: 700; color: #0f3d6e; margin: 0 0 8pt; }
   p  { font-size: 10.5pt; line-height: 14.7pt; text-align: justify; margin: 0 0 9pt; }
   table { border-collapse: collapse; width: 100%; font-size: 9.5pt; }
-  th { background: #e8eef6; } td, th { border: 0.75pt solid #b0bccc; padding: 4pt 6pt; }
-  .num { text-align: right; font-variant-numeric: tabular-nums; }
   .footer { position: absolute; left: 56pt; right: 56pt; bottom: 30pt; font-size: 8pt; color: #777; }
 </style></head>
-<body>
-  <section class="page"> <div class="band"></div> <img src="assets/images/img-5.png" ...> ... </section>
-</body></html>
+<body><section class="page"> … </section></body></html>
 ```
 
-Guidance:
-- Units in `pt` so numbers map 1:1 to `analysis.json`. `line-height` = measured `line_height`.
-- Fixed elements (bands, logos, footers, page numbers) → `position: absolute` with measured
-  coordinates. Flowing body text → normal flow inside the page padding (= measured margins).
-- One `<section class="page">` per original page when the content still fits; let content
-  flow to an extra page only when the request adds content, and keep header/footer styling
-  on every page. Use `break-inside: avoid` on table rows/figures/headings with their paragraph.
-- Fonts: system families matching the original (Helvetica/Arial, Times, ...), or `@font-face`
-  with `assets/fonts/*.ttf|otf` when `web_usable` and not subset (subset fonts lack glyphs).
-- Images: reference `assets/...` relative paths; inline `<svg>` or the exported SVGs for vector logos.
-- Page JavaScript is disabled and the network is blocked; everything must be local, under the
-  HTML file's directory (or `--root`).
+Guidance for hand-written layouts: units in `pt` (1:1 with `analysis.json`), `line-height` =
+measured `line_height`; fixed elements (bands, logos, footers) `position: absolute`, body text in
+normal flow inside the measured margins; `break-inside: avoid` for rows, figures and headings with
+their paragraph; reuse `rebuild/fonts` and `assets/` files. Page JavaScript is disabled and the
+network is blocked; everything must be local, under the HTML file's directory (or `--root`).
 
 ```bash
-"$PDF_TOOL" generate revised.html -o revised.pdf --size-from /path/original.pdf --overwrite
+"$PDF_TOOL" generate rebuild/index.html -o revised.pdf --size-from /path/original.pdf --overwrite
 ```
 
 Read `warnings` in the output: missing local files, blocked requests, clipped elements,

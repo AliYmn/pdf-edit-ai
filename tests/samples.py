@@ -139,3 +139,19 @@ def scanned(path: Path) -> Path:
 def new_image(path: Path, color=(10, 160, 90), size=(240, 80)) -> Path:
     Image.new("RGB", size, color).save(path)
     return path
+
+
+def mixed_styles(path: Path) -> Path:
+    """Bold labels followed by regular text, and a bullet with a hanging indent."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595.28, height=841.89)
+    for y, label, rest in ((100, "Backend:", " Python, FastAPI, Django"), (118, "Infra:", " Docker, Kubernetes")):
+        tw = pymupdf.TextWriter(page.rect)
+        _, end = tw.append((72, y), label, font=pymupdf.Font("hebo"), fontsize=10)
+        tw.append(end, rest, font=pymupdf.Font("helv"), fontsize=10)
+        tw.write_text(page)
+    _write(page, (72, 160), "- Led backend development of real-time trading and financial transaction systems,", size=10)
+    _write(page, (80, 172), "covering order execution and balance management.", size=10)
+    _write(page, (72, 220), "Next block.", size=10)
+    doc.save(path)
+    return path

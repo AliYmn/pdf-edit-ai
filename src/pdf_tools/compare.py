@@ -224,16 +224,23 @@ def _blocks(page: pymupdf.Page, masks: list[pymupdf.Rect]) -> list[tuple[pymupdf
     """(bbox, text, (x0, first baseline, x1, last baseline)) of text blocks that do
     not touch a mask (a block touching an edit is expected to change)."""
     out = []
-    for b in page.get_text("dict", sort=True, flags=DICT_FLAGS)["blocks"]:
-        lines = [ln for ln in b.get("lines", []) if any(s["text"].strip() for s in ln["spans"])]
+    for b in page.get_text("rawdict", sort=True, flags=DICT_FLAGS)["blocks"]:
+        lines = []
+        for ln in b.get("lines", []):
+            ink = [c for s in ln["spans"] for c in s["chars"] if not c["c"].isspace()]
+            if ink:
+                lines.append((ln, ink))
         if not lines:
             continue
         rect = pymupdf.Rect(b["bbox"])
-        text = " ".join(" ".join(s["text"] for s in ln["spans"]).strip() for ln in lines)
+        text = " ".join("".join(c["c"] for s in ln["spans"] for c in s["chars"]).strip() for ln, _ in lines)
         text = " ".join(text.split())
         if any(rect.intersects(m) for m in masks):
             continue
-        geom = (rect.x0, lines[0]["spans"][0]["origin"][1], rect.x1, lines[-1]["spans"][0]["origin"][1])
+        # extents of visible glyphs only: trailing spaces must not count as a width change
+        x0 = min(ink[0]["origin"][0] for _, ink in lines)
+        x1 = max(c["bbox"][2] for _, ink in lines for c in ink)
+        geom = (x0, lines[0][1][0]["origin"][1], x1, lines[-1][1][0]["origin"][1])
         out.append((rect, text, geom))
     return out
 
@@ -259,7 +266,9 @@ def _match_blocks(ra, rb, tol: float, shifts: list[Shift] = ()):
                 if r > best:
                     best, best_j = r, j
         if best_j is None or best < 0.85:
-            unmatched_a.append(BlockChange(text=text_a[:120], reference_bbox=rnd(rect_a)))
+            # block segmentation differs (e.g. two columns merged into one block): not missing
+            if not any(text_a in text_b or text_b in text_a for _, text_b, _ in rb):
+                unmatched_a.append(BlockChange(text=text_a[:120], reference_bbox=rnd(rect_a)))
             continue
         used.add(best_j)
         rect_b, _, gb = rb[best_j]

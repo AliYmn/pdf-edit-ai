@@ -16,6 +16,7 @@ from .models import (
     Element,
     FontInfo,
     Line,
+    Link,
     Page,
     Span,
     Table,
@@ -230,6 +231,47 @@ def shape_elements(page: pymupdf.Page, pno: int) -> tuple[list[Element], list[st
     return out, warnings
 
 
+def infer_align(lines: list[pymupdf.Rect], box: pymupdf.Rect | None = None) -> str:
+    """Rough alignment guess from line edges (inferred)."""
+    if len(lines) < 2:
+        return "left"
+    tol = 1.5
+    lefts = [r.x0 for r in lines]
+    rights = [r.x1 for r in lines]
+    same_left = max(lefts) - min(lefts) < tol
+    same_right_body = max(rights[:-1]) - min(rights[:-1]) < tol if len(lines) > 2 else abs(rights[0] - rights[1]) < tol
+    if same_left and same_right_body and len(lines) > 2:
+        return "justify"
+    if same_left or max(lefts[1:]) - min(lefts[1:]) < tol:  # left, or left with a hanging/first-line indent
+        return "left"
+    if max(rights) - min(rights) < tol:
+        return "right"
+    centers = [(r.x0 + r.x1) / 2 for r in lines]
+    if max(centers) - min(centers) < tol * 2:
+        return "center"
+    return "left"
+
+
+def page_links(page: pymupdf.Page) -> list[Link]:
+    """Hyperlinks. Producers often add one link per word piece inside a larger link
+    box; areas contained in another area with the same target are dropped."""
+    raw = []
+    for ln in page.get_links():
+        uri = ln.get("uri") or None
+        target = ln["page"] + 1 if ln.get("kind") == pymupdf.LINK_GOTO and ln.get("page", -1) >= 0 else None
+        if uri is not None or target is not None:
+            raw.append((pymupdf.Rect(ln["from"]), uri, target))
+    out = []
+    for i, (r, uri, target) in enumerate(raw):
+        covered = any(
+            (u, t) == (uri, target) and (o + (-0.5, -0.5, 0.5, 0.5)).contains(r) and (o != r or j < i)
+            for j, (o, u, t) in enumerate(raw) if j != i
+        )  # fmt: skip
+        if not covered:
+            out.append(Link(bbox=rnd(r), uri=uri, target_page=target))
+    return out
+
+
 def assign_reading_order(elements: list[Element]) -> None:
     """Top-to-bottom, left-to-right. Single-column heuristic (inferred)."""
     content = [e for e in elements if e.type != "shape"]
@@ -314,6 +356,7 @@ def inspect_pdf(path: str | Path, pages: str | None = None, shapes: bool = True,
                     image_coverage=coverage,
                     needs_ocr=needs_ocr,
                     elements=elements,
+                    links=page_links(page),
                     warnings=warnings,
                 )
             )

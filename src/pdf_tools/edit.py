@@ -8,10 +8,8 @@ to an in-memory copy; nothing is written unless every operation succeeds.
 
 from __future__ import annotations
 
-import html as htmllib
 import json
 import re
-import tempfile
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -28,11 +26,12 @@ from .common import (
     rnd,
 )
 from .fonts import ResolvedFont, resolve_font
-from .inspect import dominant_style, span_style
+from .inspect import dominant_style, infer_align, span_style
+from .richtext import Piece, Placement, Style, build_pieces, describe, layout, parse_html
 from .models import BBox
 
 RAW_FLAGS = pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES & ~pymupdf.TEXT_PRESERVE_LIGATURES
-BASELINE_RATIO = 0.8  # MuPDF's HTML layout puts the first baseline 0.8em below the line box top
+BASELINE_RATIO = 0.8  # first baseline sits 0.8em below the top of a CSS-like line box
 Overflow = Literal["error", "shrink", "allow"]
 
 
@@ -57,44 +56,66 @@ class _Style(BaseModel):
     min_scale: float = Field(0.7, gt=0.2, le=1)
 
 
-class ReplaceText(_Op, _Style):
+class Run(BaseModel):
+    """A piece of text with explicit style; unset fields follow the replaced text."""
+
+    model_config = ConfigDict(extra="forbid")
+    text: str
+    bold: bool | None = None
+    italic: bool | None = None
+    color: str | None = None
+    size: float | None = Field(None, gt=0)
+
+
+class _Content(BaseModel):
+    text: str | None = Field(None, description="Plain text; styles are transferred word by word from the old text")
+    html: str | None = Field(None, description="Simple HTML: <b>/<strong>, <i>/<em>, <br>, <p>, <span style='color:#..'>")
+    runs: list[Run] | None = Field(None, description="Explicitly styled pieces")
+
+    def _check_content(self, single_line: bool, what: str) -> None:
+        if sum(x is not None for x in (self.text, self.html, self.runs)) != 1:
+            raise ValueError(f"{what} needs exactly one of 'text', 'html' or 'runs'")
+        if single_line and "\n" in "".join(t for t, _ in styled_input(self)):
+            raise ValueError(f"{what}: this mode writes a single line; use 'rect' for line breaks")
+
+
+class ReplaceText(_Op, _Style, _Content):
     op: Literal["replace_text"]
     search: str | None = Field(None, description="Exact text to replace (within one line)")
     rect: BBox | None = Field(None, description="Replace all text in this area (paragraph mode)")
     occurrence: int | Literal["all"] = Field("all", description="1-based occurrence for search mode")
-    text: str | None = None
-    html: str | None = Field(None, description="Simple HTML instead of text (rect mode only)")
     fill: str | None = Field(None, description="Paint the cleared area with this color (default: transparent)")
 
     @model_validator(mode="after")
     def _check(self):
         if (self.search is None) == (self.rect is None):
             raise ValueError("replace_text needs exactly one of 'search' or 'rect'")
-        if (self.text is None) == (self.html is None):
-            raise ValueError("replace_text needs exactly one of 'text' or 'html'")
-        if self.html is not None and self.search is not None:
-            raise ValueError("'html' is only supported with 'rect'")
         if self.search is not None and not self.search.strip():
             raise ValueError("'search' must not be empty")
+        self._check_content(self.search is not None, "replace_text")
         return self
 
 
-class InsertText(_Op, _Style):
+class InsertText(_Op, _Style, _Content):
     op: Literal["insert_text"]
     rect: BBox | None = Field(None, description="Text box; text wraps inside it")
     point: tuple[float, float] | None = Field(None, description="Baseline start point for a single line")
-    text: str | None = None
-    html: str | None = None
 
     @model_validator(mode="after")
     def _check(self):
         if (self.rect is None) == (self.point is None):
             raise ValueError("insert_text needs exactly one of 'rect' or 'point'")
-        if (self.text is None) == (self.html is None):
-            raise ValueError("insert_text needs exactly one of 'text' or 'html'")
-        if self.point is not None and (self.html is not None or "\n" in (self.text or "")):
-            raise ValueError("'point' inserts a single line of plain text; use 'rect' for multi-line or html")
+        self._check_content(self.point is not None, "insert_text")
         return self
+
+
+def styled_input(op: _Content) -> list[tuple[str, dict]]:
+    """The new content as (text, style overrides) chunks."""
+    if op.runs is not None:
+        return [(r.text, r.model_dump(exclude={"text"}, exclude_none=True)) for r in op.runs]
+    if op.html is not None:
+        return parse_html(op.html)
+    return [(op.text or "", {})]
 
 
 class Redact(_Op):
@@ -176,6 +197,7 @@ class OpResult(BaseModel):
     font: str | None = None
     font_source: str | None = None
     scale: float | None = None
+    styled: str | None = Field(None, description="Written text with **bold**/_italic_ markers (mixed styles only)")
     height_change: float | None = Field(
         None, description="rect replace: new minus old text height in pt (pair with shift_content)"
     )
@@ -377,13 +399,6 @@ class _PageGeometry:
         return left, right
 
 
-def _write(page: pymupdf.Page, x: float, y: float, text: str, rf: ResolvedFont, size: float, color) -> pymupdf.Rect:
-    tw = pymupdf.TextWriter(page.rect)
-    rect, _ = tw.append((x, y), text, font=rf.font, fontsize=size)
-    tw.write_text(page, color=color)
-    return rect
-
-
 # ------------------------------------------------------------ operations
 
 
@@ -399,23 +414,70 @@ class _Ctx:
         return str(q if q.is_absolute() else self.base_dir / q)
 
 
-def _font_for(ctx: _Ctx, page, text: str, op: _Style, style: dict | None) -> ResolvedFont:
-    style = style or {}
-    rf = resolve_font(
-        ctx.doc,
-        page,
-        text,
-        original=style.get("font"),
-        family=op.font,
-        font_file=ctx.path(op.font_file),
-        bold=op.bold if op.bold is not None else style.get("bold"),
-        italic=op.italic if op.italic is not None else style.get("italic"),
-        serif=style.get("serif", False),
-        mono=style.get("monospace", False),
-        font_dirs=ctx.font_dirs,
-    )
-    ctx.inserted_fonts = True  # every rewrite embeds a full font program; subset on save
-    return rf
+class _Fonts:
+    """Resolve and cache one font per text style (glyph coverage checked per style)."""
+
+    def __init__(self, ctx: _Ctx, page, op: _Style, res: OpResult):
+        self.ctx, self.page, self.op, self.res = ctx, page, op, res
+        self.cache: dict[Style, ResolvedFont] = {}
+
+    def prepare(self, pieces: list[Piece]) -> None:
+        texts: dict[Style, str] = {}
+        for text, st in pieces:
+            texts[st] = texts.get(st, "") + text
+        for st, text in texts.items():
+            if st not in self.cache:
+                rf = resolve_font(
+                    self.ctx.doc, self.page, text, original=st.font, family=self.op.font,
+                    font_file=self.ctx.path(self.op.font_file), bold=st.bold, italic=st.italic,
+                    serif=st.serif, mono=st.monospace, font_dirs=self.ctx.font_dirs,
+                )  # fmt: skip
+                self.cache[st] = rf
+                self.res.warnings += [w for w in rf.warnings if w not in self.res.warnings]
+        self.ctx.inserted_fonts = True  # every rewrite embeds a font program; subset on save
+
+    def width(self, text: str, st: Style, scale: float = 1.0) -> float:
+        return self.cache[st].font.text_length(text, st.size * scale)
+
+    def summary(self, res: OpResult) -> None:
+        main = self.cache[max(self.cache, key=lambda s: s.size)] if self.cache else None
+        if main:
+            res.font, res.font_source = main.label, main.source
+
+
+def _write_placements(page, placements: list[Placement], fonts: _Fonts, scale: float) -> pymupdf.Rect:
+    """Write in reading order (a new writer only when the colour changes) so the
+    content stream - and therefore text extraction/ATS parsing - follows the text."""
+    area = pymupdf.Rect()
+    tw, color = None, None
+    for pl in placements:
+        if not pl.text.strip():
+            continue
+        if tw is None or pl.style.color != color:
+            if tw is not None:
+                tw.write_text(page, color=_rgb(color))
+            tw, color = pymupdf.TextWriter(page.rect), pl.style.color
+        rect, _ = tw.append((pl.x, pl.y), pl.text, font=fonts.cache[pl.style].font, fontsize=pl.style.size * scale)
+        area |= rect
+    if tw is not None:
+        tw.write_text(page, color=_rgb(color))
+    return area
+
+
+def _style_of(span: dict) -> Style:
+    st = span_style(span)
+    return Style(st["font"], st["size"], st["color"], st["bold"], st["italic"], st["serif"], st["monospace"])
+
+
+def _op_overrides(op: _Style) -> dict:
+    return {k: v for k, v in (("size", op.size), ("color", op.color), ("bold", op.bold), ("italic", op.italic)) if v is not None}
+
+
+def _pieces(op, old: list[Piece], base: Style, res: OpResult) -> list[Piece]:
+    pieces = build_pieces(styled_input(op), old, base, _op_overrides(op))
+    if len({(st.bold, st.italic, st.color, st.size) for t, st in pieces if t.strip()}) > 1:
+        res.styled = describe(pieces)
+    return pieces
 
 
 def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
@@ -423,16 +485,18 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
     # Process right-to-left / bottom-up so earlier hits keep valid geometry.
     hits.sort(key=lambda h: (h.line["bbox"][1], h.chars[h.start][0]["bbox"][0]), reverse=True)
     geo = _PageGeometry(page)
+    fonts = _Fonts(ctx, page, op, res)
     plans = []
     for h in hits:
         if any(p[0].line is h.line for p in plans):
             raise PdfToolError("several matches in one line; use occurrence or a rect-based replace")
-        c0, span0 = h.chars[h.start]
-        style = span_style(span0)
-        size = op.size or style["size"]
-        color = _rgb(op.color or style["color"])
-        rf = _font_for(ctx, page, op.text, op, style)
-        res.warnings += [w for w in rf.warnings if w not in res.warnings]
+        old: list[Piece] = []
+        for c, span in h.chars[h.start : h.end]:
+            st = _style_of(span)
+            old = old[:-1] + [(old[-1][0] + c["c"], st)] if old and old[-1][1] == st else old + [(c["c"], st)]
+        pieces = _pieces(op, old, old[0][1], res)
+        fonts.prepare(pieces)
+        c0 = h.chars[h.start][0]
         line_rect = pymupdf.Rect(h.line["bbox"])
         left_lim, right_lim = geo.limits(line_rect, h.block, h.line["rects"])
         x_start = c0["origin"][0]
@@ -441,16 +505,15 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
         line_x0 = h.chars[0][0]["bbox"][0]
         line_x1 = h.chars[-1][0]["bbox"][2]
         align = op.align if op.align in ("right", "center") else "left"
-        scale, layout = 1.0, None
+        scale = 1.0
         while True:
-            new_w = rf.font.text_length(op.text, size * scale)
+            new_w = sum(fonts.width(t, st, scale) for t, st in pieces)
             delta = new_w - old_w
             shift_pre = -delta if align == "right" else -delta / 2 if align == "center" else 0.0
             shift_post = 0.0 if align == "right" else delta / 2 if align == "center" else delta
             new_x0 = line_x0 + shift_pre if h.start > 0 else x_start + shift_pre
             new_x1 = line_x1 + shift_post if h.end < len(h.chars) else x_start + shift_pre + new_w
             fits = new_x0 >= left_lim - 0.5 and new_x1 <= right_lim + 0.5
-            layout = (delta, shift_pre, shift_post, new_x0, new_x1)
             if fits or op.overflow == "allow":
                 if not fits:
                     res.warnings.append(f"line extends to x={new_x1:.1f} (limit {right_lim:.1f}); may overlap neighbours")
@@ -463,9 +526,9 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
                 f"{left_lim:.1f}..{right_lim:.1f} (needs {new_w:.1f}pt, original {old_w:.1f}pt). "
                 "Shorten the text, use overflow 'shrink', or replace the whole paragraph with a rect."
             )
-        plans.append((h, style, size * scale, color, rf, layout, scale))
+        plans.append((h, pieces, (delta, shift_pre, shift_post), scale))
 
-    for h, _style, size, color, rf, (delta, shift_pre, shift_post, _x0, _x1), scale in plans:
+    for h, pieces, (delta, shift_pre, shift_post), scale in plans:
         moved: list[tuple[int, int, float]] = []  # (from, to, shift) char ranges that must be rewritten
         if abs(delta) > 0.05:
             if shift_pre and h.start > 0:
@@ -476,7 +539,12 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
         rects = [_union(c["bbox"] for c, _ in h.chars[a:b]) for a, b in redact_idx]
         y = h.chars[h.start][0]["origin"][1]
         _redact(page, rects, op.fill)
-        written = _write(page, h.chars[h.start][0]["origin"][0] + shift_pre, y, op.text, rf, size, color)
+        x = h.chars[h.start][0]["origin"][0] + shift_pre
+        placements = []
+        for text, st in pieces:
+            placements.append(Placement(x, y, text, st))
+            x += fonts.width(text, st, scale)
+        written = _write_placements(page, placements, fonts, scale)
         for a, b, shift in moved:
             # rewrite untouched neighbours span by span, shifted horizontally
             k = a
@@ -496,232 +564,133 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
                         msg = f"neighbouring text {seg.strip()!r} re-set in {seg_font.label} (original font not reusable)"
                         res.warnings.append(msg)
                     c0 = h.chars[k][0]
-                    written |= _write(page, c0["origin"][0] + shift, c0["origin"][1], seg, seg_font, st["size"], _rgb(st["color"]))
+                    tw = pymupdf.TextWriter(page.rect)
+                    rect, _ = tw.append((c0["origin"][0] + shift, c0["origin"][1]), seg, font=seg_font.font, fontsize=st["size"])
+                    tw.write_text(page, color=_rgb(st["color"]))
+                    written |= rect
                 k = j
         res.rects.append(rnd(_union(rects) | written))
-        res.font, res.font_source = rf.label, rf.source
         if scale < 1:
             res.scale = scale
             res.warnings.append(f"replacement scaled to {scale:.0%} to fit")
-
-
-TEXT_ALIGN = {
-    "left": pymupdf.TEXT_ALIGN_LEFT,
-    "center": pymupdf.TEXT_ALIGN_CENTER,
-    "right": pymupdf.TEXT_ALIGN_RIGHT,
-    "justify": pymupdf.TEXT_ALIGN_JUSTIFY,
-}
-
-
-def _place_text(
-    page, box: pymupdf.Rect, first_baseline: float, text: str, rf: ResolvedFont, size: float, color: str,
-    pitch: float, align: str, op: _Style, res: OpResult,
-) -> tuple[pymupdf.Rect, float]:  # fmt: skip
-    """Wrap plain text into ``box`` starting exactly at ``first_baseline``.
-
-    Uses TextWriter (one glyph per character): MuPDF's HTML layout forms ligatures
-    that subset fonts cannot map back to Unicode, which breaks text extraction.
-    """
-    ratio = pitch / size
-
-    def layout(scale: float, target_page) -> tuple[pymupdf.TextWriter, float]:
-        fs = size * scale
-        base = box.y0 + (first_baseline - box.y0) * scale  # keep the line-box top fixed when shrinking
-        tw = pymupdf.TextWriter(target_page.rect)
-        # fill_textbox indents every line after the first by 0.2em; start the rect that much earlier
-        rect = pymupdf.Rect(box.x0 - 0.2 * fs, box.y0, box.x1, target_page.rect.y1)
-        over = tw.fill_textbox(rect, text, pos=(box.x0, base), font=rf.font, fontsize=fs, lineheight=ratio, align=TEXT_ALIGN[align])
-        if over:
-            raise PdfToolError("text runs past the bottom of the page")
-        lines = round((tw.last_point.y - base) / (pitch * scale)) + 1
-        return tw, lines * pitch * scale
-
-    scratch = pymupdf.open()
-    probe = scratch.new_page(width=page.rect.width, height=box.y0 + 10000)
-    scale = 1.0
-    _, needed = layout(1.0, probe)
-    used = needed
-    while used > box.height + 0.5:
-        if op.overflow == "shrink" and scale - 0.02 >= op.min_scale - 1e-9:
-            scale = round(scale - 0.02, 2)
-            _, used = layout(scale, probe)
-            continue
-        if op.overflow == "allow":
-            if box.y0 + used > page.rect.y1:
-                raise PdfToolError(f"text needs {used:.1f}pt height and would run off the page")
-            res.warnings.append(f"text extends {used - box.height:.1f}pt below the box; check for overlap")
-            break
-        hint = "Shorten the text, enlarge the rect, use overflow 'shrink', or reconstruct the document."
-        if op.overflow == "shrink":
-            raise PdfToolError(f"text does not fit even at {op.min_scale:.0%} scale (needs {needed:.1f}pt, box {box.height:.1f}pt)")
-        raise PdfToolError(f"text needs {needed:.1f}pt height but the box has {box.height:.1f}pt. {hint}")
-    scratch.close()
-    tw, used = layout(scale, page)
-    tw.write_text(page, color=_rgb(color))
-    if scale < 1:
-        res.scale = scale
-        res.warnings.append(f"text scaled to {scale:.0%} to fit")
-    return pymupdf.Rect(box.x0, box.y0, box.x1, box.y0 + used), used
-
-
-def _css(rf: ResolvedFont, size: float, color: str, line_ratio: float, align: str, arc_dir: Path) -> str:
-    weight = "bold" if rf.bold else "normal"
-    style = "italic" if rf.italic else "normal"
-    if rf.generic:
-        family, face = rf.generic, ""
-    else:
-        fname = f"face.{rf.ext}"
-        (arc_dir / fname).write_bytes(rf.buffer or b"")
-        family = '"EditFace"'
-        # the file already carries its weight/style; declare it for every combination
-        face = "".join(
-            f'@font-face {{font-family: {family}; src: url("{fname}"); font-weight: {w}; font-style: {s};}}\n'
-            for w in ("normal", "bold")
-            for s in ("normal", "italic")
-        )
-        weight = style = "normal"
-    return (
-        # note: a '*' margin reset shifts MuPDF's first baseline by 1pt; reset body/p only
-        f"{face}body {{margin: 0; padding: 0; font-family: {family}; font-size: {size:.2f}pt; color: {color}; line-height: {line_ratio:.4f}; "
-        f"text-align: {align}; font-weight: {weight}; font-style: {style};}}\n"
-        "p { margin: 0; }\n"
-    )
-
-
-def _place_html(
-    ctx: _Ctx, page, box: pymupdf.Rect, html: str, rf: ResolvedFont, size: float, color: str,
-    line_ratio: float, align: str, op: _Style, res: OpResult,
-) -> pymupdf.Rect:  # fmt: skip
-    """Measure, apply the overflow policy, then insert HTML into ``box``."""
-    with tempfile.TemporaryDirectory(prefix="pdf-tool-font-") as tmp:
-        arc_dir = Path(tmp)
-        css = _css(rf, size, color, line_ratio, align, arc_dir)
-        arc = pymupdf.Archive(str(arc_dir))
-        scratch = pymupdf.open()
-        probe_h = 10000
-        sp = scratch.new_page(width=page.rect.width, height=box.y0 + probe_h + 10)
-        spare, _ = sp.insert_htmlbox(pymupdf.Rect(box.x0, box.y0, box.x1, box.y0 + probe_h), html, css=css, archive=arc, scale_low=1)
-        scratch.close()
-        needed = probe_h - spare if spare >= 0 else float("inf")
-        target, scale_low = box, 1
-        if needed > box.height + 0.5:
-            if op.overflow == "shrink":
-                scale_low = op.min_scale
-            elif op.overflow == "allow":
-                target = pymupdf.Rect(box.x0, box.y0, box.x1, box.y0 + needed + 1)
-                if target.y1 > page.rect.y1:
-                    raise PdfToolError(f"text needs {needed:.1f}pt height and would run off the page")
-                res.warnings.append(f"text extends {needed - box.height:.1f}pt below the box; check for overlap")
-            else:
-                raise PdfToolError(
-                    f"text needs {needed:.1f}pt height but the box has {box.height:.1f}pt. "
-                    "Shorten the text, enlarge the rect, use overflow 'shrink', or reconstruct the document."
-                )
-        spare, scale = page.insert_htmlbox(target, html, css=css, archive=arc, scale_low=scale_low)
-        if spare < 0:
-            raise PdfToolError(f"text does not fit even at {op.min_scale:.0%} scale (needs {needed:.1f}pt, box {box.height:.1f}pt)")
-        if scale < 0.999:
-            res.scale = round(scale, 3)
-            res.warnings.append(f"text scaled to {scale:.0%} to fit")
-        return target, min(needed, target.height) * scale
-
-
-def _infer_align(lines: list[pymupdf.Rect], box: pymupdf.Rect) -> str:
-    """Rough alignment guess from line edges (inferred)."""
-    if len(lines) < 2:
-        return "left"
-    tol = 1.5
-    lefts = [r.x0 for r in lines]
-    rights = [r.x1 for r in lines]
-    same_left = max(lefts) - min(lefts) < tol
-    same_right_body = max(rights[:-1]) - min(rights[:-1]) < tol if len(lines) > 2 else abs(rights[0] - rights[1]) < tol
-    if same_left and same_right_body and len(lines) > 2:
-        return "justify"
-    if same_left:
-        return "left"
-    if max(rights) - min(rights) < tol:
-        return "right"
-    centers = [(r.x0 + r.x1) / 2 for r in lines]
-    if max(centers) - min(centers) < tol * 2:
-        return "center"
-    return "left"
+    fonts.summary(res)
 
 
 def _replace_rect(ctx: _Ctx, page, op: ReplaceText | InsertText, res: OpResult) -> None:
     box = pymupdf.Rect(op.rect) & page.rect
     if box.is_empty:
         raise PdfToolError("rect is empty or outside the page")
+    old: list[Piece] = []
     spans, line_rects, baselines = [], [], []
     for b in page.get_text("dict", flags=RAW_FLAGS)["blocks"]:
         if b["type"] != 0:
             continue
         for ln in b["lines"]:
             inside = [s for s in ln["spans"] if s["text"].strip() and pymupdf.Rect(s["bbox"]) in box + (-1, -1, 1, 1)]
-            if inside:
-                spans += inside
-                line_rects.append(pymupdf.Rect(ln["bbox"]))
-                baselines.append(inside[0]["origin"][1])
+            if not inside:
+                continue
+            if old:
+                old.append((" ", old[-1][1]))  # line break inside a paragraph = space
+            old += [(s["text"], _style_of(s)) for s in inside]
+            spans += inside
+            line_rects.append(pymupdf.Rect(ln["bbox"]))
+            baselines.append(inside[0]["origin"][1])
     is_replace = isinstance(op, ReplaceText)
     if is_replace and not spans:
         res.warnings.append("no existing text found inside rect; text inserted with default style")
     if not is_replace and spans:
         res.warnings.append("rect overlaps existing text; use replace_text to replace it")
-    style = {}
     if spans:
-        style = dominant_style(spans) or {}
+        dom = dominant_style(spans) or {}
         first = span_style(spans[0])
-        style |= {"serif": first["serif"], "monospace": first["monospace"]}
-    size = op.size or style.get("size") or 11.0
-    color = op.color or style.get("color") or "#000000"
+        base = Style(dom["font"], dom["size"], dom["color"], dom["bold"], dom["italic"], first["serif"], first["monospace"])
+    else:
+        base = Style(op.font or "Helvetica", op.size or 11.0, op.color or "#000000", bool(op.bold), bool(op.italic))
+    pieces = _pieces(op, old, base, res)
+    size = op.size or base.size
     gaps = sorted(b - a for a, b in zip(baselines, baselines[1:]) if b - a > 0.5)
     pitch = op.line_height or (gaps[len(gaps) // 2] if gaps else size * 1.2)
-    line_ratio = pitch / size
-    align = op.align or (_infer_align(line_rects, box) if is_replace else "left")
+    align = op.align or (infer_align(line_rects, box) if is_replace else "left")
     if is_replace and not op.align and len(line_rects) > 1:
         res.warnings.append(f"alignment inferred as '{align}'")
-    plain = op.text if op.text is not None else re.sub(r"<[^>]+>", "", op.html or "")
-    rf = _font_for(ctx, page, htmllib.unescape(plain), op, style)
-    res.warnings += [w for w in rf.warnings if w not in res.warnings]
+    fonts = _Fonts(ctx, page, op, res)
+    fonts.prepare(pieces)
     if is_replace and spans:
         _redact(page, [box], op.fill)
-    top = (baselines[0] - BASELINE_RATIO * size - (line_ratio - 1) * size / 2) if baselines else box.y0
-    left = min(r.x0 for r in line_rects) if line_rects else box.x0  # the original text edge, not the rough rect
-    target = pymupdf.Rect(max(box.x0, left), top, box.x1, box.y1)
-    if op.text is not None:
-        first = baselines[0] if baselines else top + (line_ratio - 1) * size / 2 + BASELINE_RATIO * size
-        placed, used_h = _place_text(page, target, first, op.text, rf, size, color, pitch, align, op, res)
-    else:
-        placed, used_h = _place_html(ctx, page, target, op.html, rf, size, color, line_ratio, align, op, res)
-    res.rects.append(rnd(placed))
+    # first-line and following-line starts (keeps hanging indents such as "- " bullets)
+    x_first = line_rects[0].x0 if line_rects else box.x0
+    x_rest = min(r.x0 for r in line_rects[1:]) if len(line_rects) > 1 else x_first
+    top = (baselines[0] - BASELINE_RATIO * size - (pitch / size - 1) * size / 2) if baselines else box.y0
+    first = baselines[0] if baselines else box.y0 + (pitch - size) / 2 + BASELINE_RATIO * size
+    available = box.y1 - top
+
+    def run(scale: float):
+        try:
+            return layout(pieces, lambda t, st: fonts.width(t, st, scale), x_first, x_rest, box.x1,
+                          top + (first - top) * scale, pitch * scale, align)  # fmt: skip
+        except ValueError as exc:
+            raise PdfToolError(str(exc)) from exc
+
+    scale = 1.0
+    placements, n = run(scale)
+    needed = n * pitch
+    while n * pitch * scale > available + 0.5:
+        if op.overflow == "shrink" and scale - 0.02 >= op.min_scale - 1e-9:
+            scale = round(scale - 0.02, 2)
+            placements, n = run(scale)
+            continue
+        if op.overflow == "allow":
+            if top + n * pitch > page.rect.y1:
+                raise PdfToolError(f"text needs {needed:.1f}pt height and would run off the page")
+            res.warnings.append(f"text extends {needed - available:.1f}pt below the box; check for overlap")
+            break
+        if op.overflow == "shrink":
+            raise PdfToolError(f"text does not fit even at {op.min_scale:.0%} scale (needs {needed:.1f}pt, box {available:.1f}pt)")
+        raise PdfToolError(
+            f"text needs {needed:.1f}pt height but the box has {available:.1f}pt (y {top:.1f}-{box.y1:.1f}). "
+            "Shorten the text, enlarge the rect, use overflow 'shrink', or reconstruct the document."
+        )
+    _write_placements(page, placements, fonts, scale)
+    used_h = n * pitch * scale
+    if scale < 1:
+        res.scale = scale
+        res.warnings.append(f"text scaled to {scale:.0%} to fit")
+    res.rects.append(rnd(pymupdf.Rect(min(x_first, x_rest), top, box.x1, top + used_h)))
     res.reference_rects.append(rnd(box))
     if is_replace and baselines:
         res.height_change = round(used_h - (baselines[-1] - baselines[0] + pitch), 2)
-    res.font, res.font_source = rf.label, rf.source
+    fonts.summary(res)
 
 
 def _insert_point(ctx: _Ctx, page, op: InsertText, res: OpResult) -> None:
-    rf = _font_for(ctx, page, op.text or "", op, None)
-    res.warnings += rf.warnings
-    size = op.size or 11.0
+    base = Style(op.font or "Helvetica", op.size or 11.0, op.color or "#000000", bool(op.bold), bool(op.italic))
+    pieces = _pieces(op, [], base, res)
+    fonts = _Fonts(ctx, page, op, res)
+    fonts.prepare(pieces)
     x, y = op.point
     scale = 1.0
     while True:
-        w = rf.font.text_length(op.text, size * scale)
+        w = sum(fonts.width(t, st, scale) for t, st in pieces)
         if x + w <= page.rect.x1 or op.overflow == "allow":
             break
         if op.overflow == "shrink" and scale - 0.02 >= op.min_scale - 1e-9:
             scale = round(scale - 0.02, 2)
             continue
         raise PdfToolError(f"text is {w:.1f}pt wide and runs past the page edge at x={page.rect.x1:.1f}")
-    s = size * scale
-    area = pymupdf.Rect(x, y - rf.font.ascender * s, x + w, y - rf.font.descender * s)
+    big = max((st for _, st in pieces), key=lambda st: st.size)
+    f = fonts.cache[big].font
+    area = pymupdf.Rect(x, y - f.ascender * big.size * scale, x + w, y - f.descender * big.size * scale)
     if page.get_text("words", clip=area):
         res.warnings.append("inserted line overlaps existing text")
-    rect = _write(page, x, y, op.text, rf, s, _rgb(op.color))
+    placements = []
+    for text, st in pieces:
+        placements.append(Placement(x, y, text, st))
+        x += fonts.width(text, st, scale)
+    rect = _write_placements(page, placements, fonts, scale)
     if scale < 1:
         res.scale = scale
     res.rects.append(rnd(rect))
-    res.font, res.font_source = rf.label, rf.source
+    fonts.summary(res)
 
 
 def _redact_op(ctx: _Ctx, page, op: Redact, res: OpResult) -> None:
@@ -895,10 +864,10 @@ def _xref_from_asset(asset_id: str) -> int:
 def _verify(doc: pymupdf.Document, op, res: OpResult) -> None:
     page = doc[op.page - 1]
     if isinstance(op, (ReplaceText, InsertText)) and res.rects:
-        expected = op.text if op.text is not None else htmllib.unescape(re.sub(r"<[^>]+>", "", op.html or ""))
+        expected = "".join(t for t, _ in styled_input(op))
         area = _union(res.rects) + (-2, -2, 2, 2)
-        found = page.get_text("text", clip=pymupdf.Rect(0, area.y0, page.rect.x1, area.y1))
-        res.verified = _squash(expected) in _squash(found)
+        words = page.get_text("words", clip=pymupdf.Rect(0, area.y0, page.rect.x1, area.y1), sort=True)
+        res.verified = _squash(expected) in "".join(w[4] for w in words)
         if not res.verified:
             res.warnings.append("could not read the new text back from the output")
     elif isinstance(op, Redact):

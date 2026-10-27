@@ -36,6 +36,20 @@ ALIASES = {
     "courier": "couriernew",
     "liberationsans": "arial",
     "liberationserif": "timesnewroman",
+    "nimbussans": "arial",
+    "nimbusroman": "timesnewroman",
+    "nimbusmono": "couriernew",
+}
+# CSS family names of metric-compatible system fonts, for browser rendering
+CSS_ALIASES = {
+    "nimbussans": ["Helvetica", "Arial"],
+    "helvetica": ["Helvetica", "Arial"],
+    "arial": ["Arial", "Helvetica"],
+    "nimbusroman": ["Times New Roman", "Times"],
+    "times": ["Times New Roman", "Times"],
+    "timesnewroman": ["Times New Roman", "Times"],
+    "nimbusmono": ["Courier New", "Courier"],
+    "courier": ["Courier New", "Courier"],
 }
 STYLE_WORDS = (
     "bolditalic", "boldoblique", "semibold", "demibold", "extrabold", "bold", "italic", "oblique",
@@ -147,6 +161,15 @@ def embedded_fonts(doc: pymupdf.Document, page: pymupdf.Page) -> dict[str, tuple
     return out
 
 
+def embedded_variant(doc: pymupdf.Document, page: pymupdf.Page, family: str, bold: bool, italic: bool) -> str | None:
+    """Normalized name of an embedded font on the page with this family and style
+    (e.g. the Bold sibling of 'FiraSans-Regular'); matches BaseFont or program name."""
+    for key in embedded_fonts(doc, page):
+        if split_font_name(key) == (family, bold, italic):
+            return key
+    return None
+
+
 def resolve_font(
     doc: pymupdf.Document,
     page: pymupdf.Page,
@@ -175,6 +198,13 @@ def resolve_font(
             raise PdfToolError(f"font_file {p.name} has no glyphs for {''.join(miss)!r}")
         return ResolvedFont(f, f.name, "font_file", want_bold, want_italic, p.read_bytes(), p.suffix.lstrip(".").lower())
 
+    if original and not family and (want_bold, want_italic) != (name_bold, name_italic):
+        sibling = embedded_variant(doc, page, fam, want_bold, want_italic)
+        if sibling:
+            original = sibling
+        else:
+            notes.append(f"no embedded {'bold ' if want_bold else ''}{'italic ' if want_italic else ''}variant of '{original}'")
+            original = None
     if original and not family:
         emb = embedded_fonts(doc, page).get(norm_name(original))
         if emb:

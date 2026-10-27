@@ -91,6 +91,12 @@ class Element(BaseModel):
     stroke_width: float | None = None
 
 
+class Link(BaseModel):
+    bbox: BBox
+    uri: str | None = Field(None, description="External target (https:, mailto:, tel:, ...)")
+    target_page: int | None = Field(None, description="1-based page for internal links")
+
+
 class Page(BaseModel):
     number: int = Field(description="1-based page number")
     width: float
@@ -101,6 +107,7 @@ class Page(BaseModel):
     image_coverage: float = Field(description="Fraction of page area covered by images")
     needs_ocr: bool = Field(description="Inferred: little or no usable text layer")
     elements: list[Element]
+    links: list[Link] = []
     warnings: list[str] = []
 
 

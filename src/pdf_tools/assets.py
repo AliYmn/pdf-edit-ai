@@ -10,9 +10,10 @@ import pymupdf
 
 from .common import open_pdf, require_dir_output, rnd, strip_subset, write_json
 from .models import Asset, AssetManifest, Placement
+from .vector import is_background, is_graphic, padded_rect, svg_document
 
 WEB_FONT_EXTS = {"ttf", "otf", "woff", "woff2"}
-MAX_VECTORS_PER_PAGE = 20
+MAX_VECTORS_PER_PAGE = 40
 
 
 def _sha(data: bytes) -> str:
@@ -52,7 +53,7 @@ def _role(placements: list[Placement], doc: pymupdf.Document) -> str:
     return "image"
 
 
-def _export_images(doc: pymupdf.Document, out: Path, min_size: int, warnings: list[str]) -> list[Asset]:
+def export_images(doc: pymupdf.Document, out: Path, min_size: int, warnings: list[str]) -> list[Asset]:
     placements: dict[str, list[Placement]] = defaultdict(list)
     inline: dict[str, tuple[int, pymupdf.Rect]] = {}
     for page in doc:
@@ -106,67 +107,63 @@ def _export_images(doc: pymupdf.Document, out: Path, min_size: int, warnings: li
     return assets
 
 
-def _has_curves(drawings: list[dict], rect: pymupdf.Rect) -> bool:
-    for d in drawings:
-        if d["rect"].intersects(rect) and any(item[0] in ("c", "qu") for item in d["items"]):
-            return True
-    return False
+def export_vectors(doc: pymupdf.Document, out: Path, warnings: list[str]) -> list[Asset]:
+    """Export icon/logo-like vector groups as SVG (from the path data) + 300 dpi PNG.
 
-
-def _export_vectors(doc: pymupdf.Document, out: Path, warnings: list[str]) -> list[Asset]:
-    """Export clusters of curved vector paths (typical for vector logos/icons)."""
-    assets = []
+    Large background fills are ignored so they do not merge everything into one
+    cluster; plain rules, boxes and table grids are skipped. Identical graphics
+    (e.g. the same icon used several times) become one asset with several placements.
+    """
+    by_svg: dict[str, Asset] = {}
     for page in doc:
-        drawings = page.get_drawings()
+        drawings = [d for d in page.get_drawings() if not is_background(d, page.rect)]
         if not drawings:
             continue
         page_area = abs(page.rect)
-        clusters = [
-            r
-            for r in page.cluster_drawings(drawings=drawings)
-            if r.width >= 8 and r.height >= 8 and 0.0005 < abs(r) / page_area < 0.5 and _has_curves(drawings, r)
-        ]
-        if len(clusters) > MAX_VECTORS_PER_PAGE:
-            warnings.append(f"page {page.number + 1}: {len(clusters)} vector clusters, exporting the largest {MAX_VECTORS_PER_PAGE}")
-            clusters = sorted(clusters, key=abs, reverse=True)[:MAX_VECTORS_PER_PAGE]
-        for k, rect in enumerate(clusters, 1):
-            aid = f"vec-p{page.number + 1}-{k}"
+        groups = []
+        for rect in page.cluster_drawings(drawings=drawings):
+            members = [d for d in drawings if (rect + (-0.5, -0.5, 0.5, 0.5)).contains(d["rect"])]
+            if members and rect.width >= 4 and rect.height >= 4 and abs(rect) < 0.5 * page_area and is_graphic(members):
+                groups.append((rect, members))
+        if len(groups) > MAX_VECTORS_PER_PAGE:
+            warnings.append(f"page {page.number + 1}: {len(groups)} vector graphics, exporting the largest {MAX_VECTORS_PER_PAGE}")
+            groups = sorted(groups, key=lambda g: abs(g[0]), reverse=True)[:MAX_VECTORS_PER_PAGE]
+        for _rect, members in groups:
+            box = padded_rect(members)
+            svg = svg_document(members, box)
+            place = Placement(page=page.number + 1, bbox=rnd(box))
+            if svg in by_svg:
+                asset = by_svg[svg]
+                asset.placements.append(place)
+                if place.page not in asset.pages:
+                    asset.pages.append(place.page)
+                continue
+            aid = f"vec-p{page.number + 1}-{sum(a.pages[0] == page.number + 1 for a in by_svg.values()) + 1}"
             base = out / "vectors" / aid
             base.parent.mkdir(parents=True, exist_ok=True)
-            # SVG: show the clipped region on a page of the same size, then export.
-            tmp = pymupdf.open()
-            tpage = tmp.new_page(width=rect.width, height=rect.height)
-            tpage.show_pdf_page(tpage.rect, doc, page.number, clip=rect)
-            svg = tpage.get_svg_image(text_as_path=True)
-            tmp.close()
             base.with_suffix(".svg").write_text(svg, encoding="utf-8")
-            pix = page.get_pixmap(clip=rect, dpi=300, alpha=True)
-            png = pix.tobytes("png")
-            base.with_suffix(".png").write_bytes(png)
-            place = Placement(page=page.number + 1, bbox=rnd(rect))
-            role = "logo-candidate" if rect.y1 <= page.rect.height * 0.2 else "vector-graphic"
-            assets.append(
-                Asset(
-                    id=aid,
-                    kind="vector",
-                    file=str(base.with_suffix(".svg").relative_to(out)),
-                    pages=[page.number + 1],
-                    placements=[place],
-                    width=pix.width,
-                    height=pix.height,
-                    format="svg",
-                    role=role,
-                    sha256=_sha(svg.encode()),
-                    notes=[
-                        f"PNG render (300 dpi, transparent): {base.with_suffix('.png').relative_to(out)}",
-                        "region crop: any text or images inside the region are included",
-                    ],
-                )
+            with pymupdf.open(stream=svg.encode(), filetype="svg") as rendered:
+                pix = rendered[0].get_pixmap(dpi=300, alpha=True)
+            pix.save(base.with_suffix(".png"))
+            small = max(box.width, box.height) < 24
+            role = "icon" if small else "logo-candidate" if box.y1 <= page.rect.height * 0.2 else "vector-graphic"
+            by_svg[svg] = Asset(
+                id=aid,
+                kind="vector",
+                file=str(base.with_suffix(".svg").relative_to(out)),
+                pages=[page.number + 1],
+                placements=[place],
+                width=pix.width,
+                height=pix.height,
+                format="svg",
+                role=role,
+                sha256=_sha(svg.encode()),
+                notes=[f"PNG (300 dpi, transparent): {base.with_suffix('.png').relative_to(out)}"],
             )
-    return assets
+    return list(by_svg.values())
 
 
-def _export_fonts(doc: pymupdf.Document, out: Path, warnings: list[str]) -> list[Asset]:
+def export_fonts(doc: pymupdf.Document, out: Path, warnings: list[str]) -> list[Asset]:
     seen: dict[int, Asset] = {}
     for page in doc:
         for xref, ext, ftype, basefont, *_ in page.get_fonts(full=True):
@@ -224,10 +221,10 @@ def extract_assets(path: str | Path, out_dir: str | Path, min_size: int = 8, vec
     doc = open_pdf(path)
     try:
         warnings: list[str] = []
-        assets = _export_images(doc, out, min_size, warnings)
+        assets = export_images(doc, out, min_size, warnings)
         if vectors:
-            assets += _export_vectors(doc, out, warnings)
-        assets += _export_fonts(doc, out, warnings)
+            assets += export_vectors(doc, out, warnings)
+        assets += export_fonts(doc, out, warnings)
         manifest = AssetManifest(source=str(Path(path).resolve()), assets=assets, warnings=warnings)
         write_json(manifest, out / "manifest.json")
         return manifest

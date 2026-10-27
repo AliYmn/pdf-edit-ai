@@ -230,3 +230,70 @@ def test_shift_content_refuses_unsafe_moves(pdfs, tmp_path):
         with pytest.raises(EditError, match=msg):
             edit(pdfs["paragraph"], tmp_path, [{"op": "shift_content", "page": 1, **args}])
     assert not (tmp_path / "out.pdf").exists()
+
+
+def spans_with(path, needle):
+    with pymupdf.open(path) as doc:
+        return [s for b in doc[0].get_text("dict")["blocks"] for ln in b.get("lines", []) for s in ln["spans"]
+                if needle in s["text"]]  # fmt: skip
+
+
+def is_bold(span):
+    return bool(span["flags"] & 16) or "bold" in span["font"].lower()
+
+
+def test_mixed_style_line_keeps_bold_label(tmp_path):
+    from samples import mixed_styles
+
+    src = mixed_styles(tmp_path / "mixed.pdf")
+    rep = edit(src, tmp_path, [
+        {"op": "replace_text", "page": 1, "search": "Backend: Python, FastAPI, Django", "text": "Backend: Go, Rust, Python"},
+        {"op": "replace_text", "page": 1, "search": "Infra: Docker, Kubernetes", "text": "Platform: Docker, Nomad"},
+    ])  # fmt: skip
+    assert rep.ok and all(r.verified for r in rep.results)
+    assert rep.results[0].styled == "**Backend:** Go, Rust, Python"
+    assert rep.results[1].styled == "**Platform:** Docker, Nomad"  # replaced label takes the label's style
+    out = tmp_path / "out.pdf"
+    assert is_bold(spans_with(out, "Backend:")[0]) and not is_bold(spans_with(out, "Go, Rust")[0])
+    assert is_bold(spans_with(out, "Platform:")[0]) and not is_bold(spans_with(out, "Nomad")[0])
+    assert rep.results[0].font_source == "original-embedded"
+
+
+def test_runs_and_html_styles(tmp_path, pdfs):
+    from samples import mixed_styles
+
+    src = mixed_styles(tmp_path / "mixed.pdf")
+    rep = edit(src, tmp_path, [
+        {"op": "replace_text", "page": 1, "search": "FastAPI", "runs": [{"text": "FastAPI", "italic": True}]},
+        {"op": "insert_text", "page": 1, "rect": [72, 260, 400, 320],
+         "html": "<b>Note:</b> styles come from <i>simple</i> HTML<br>and a <span style='color:#cc0000'>red</span> word."},
+    ])  # fmt: skip
+    assert rep.ok and all(r.verified for r in rep.results)
+    out = tmp_path / "out.pdf"
+    assert spans_with(out, "FastAPI")[0]["flags"] & 2  # italic
+    assert is_bold(spans_with(out, "Note:")[0]) and not is_bold(spans_with(out, "styles come")[0])
+    assert spans_with(out, "red")[0]["color"] == 0xCC0000
+    lines = [s["origin"][1] for s in spans_with(out, "and a")]
+    assert lines and lines[0] > spans_with(out, "Note:")[0]["origin"][1]  # <br> started a new line
+
+
+def test_rect_replace_keeps_hanging_indent_and_styles(tmp_path):
+    from samples import mixed_styles
+
+    src = mixed_styles(tmp_path / "mixed.pdf")
+    new = "- Led backend development of real-time trading, settlement and reconciliation services across many venues and markets."
+    rep = edit(src, tmp_path, [{"op": "replace_text", "page": 1, "rect": [70, 150, 523, 176], "text": new}])
+    assert rep.ok and rep.results[0].verified
+    with pymupdf.open(tmp_path / "out.pdf") as doc:
+        starts = sorted({round(ln["spans"][0]["origin"][0], 1) for b in doc[0].get_text("dict")["blocks"]
+                         for ln in b.get("lines", []) if 155 < ln["spans"][0]["origin"][1] < 200})  # fmt: skip
+    assert starts == [72.0, 80.0]  # first line at the dash, continuation lines indented
+
+
+def test_bold_run_uses_embedded_sibling_font(tmp_path):
+    from samples import mixed_styles
+
+    src = mixed_styles(tmp_path / "mixed.pdf")
+    rep = edit(src, tmp_path, [{"op": "replace_text", "page": 1, "search": "Django", "runs": [{"text": "Django", "bold": True}]}])
+    assert rep.ok and rep.results[0].font_source == "original-embedded"
+    assert is_bold(spans_with(tmp_path / "out.pdf", "Django")[0])

@@ -51,11 +51,12 @@ Paths with spaces work. Existing files, including the input PDF, are never overw
 
 | Command | Purpose |
 |---|---|
-| `pdf-tool inspect in.pdf -o analysis.json` | Layout JSON: pages, text blocks → lines → spans (font, size, color, bold/italic, baseline origin), line pitch, images (asset ids), tables (cells and cell boxes), vector shapes (fill/stroke), page background, fonts (embedded/subset, sizes used), metadata, OCR need. With `-o`, a short summary goes to stdout. Without it, the full JSON does. |
+| `pdf-tool inspect in.pdf -o analysis.json` | Layout JSON: pages, text blocks → lines → spans (font, size, color, bold/italic, baseline origin), line pitch, images (asset ids), tables (cells and cell boxes), vector shapes (fill/stroke), links, page background, fonts (embedded/subset, sizes used), metadata, OCR need. With `-o`, a short summary goes to stdout. Without it, the full JSON does. |
 | `pdf-tool extract in.pdf --format markdown\|json\|html [-o dir]` | Marker extraction (headings, lists, tables, images, page-aware). PyMuPDF decides first whether OCR is needed (`--ocr auto\|force\|never`). Several PDFs per call reuse the loaded models. `--engine pymupdf` is a fast fallback that never OCRs. |
 | `pdf-tool render in.pdf --dpi 150 [-p 1-3] [-o dir]` | PNG per page (`page-001.png`, …). |
-| `pdf-tool assets in.pdf -o assets` | Images (original JPEG/PNG bytes when browser-usable, otherwise RGB(A) PNG), curved vector clusters (SVG + 300 dpi PNG), embedded font programs, all listed in `manifest.json` with ids, placements and an inferred role (`logo-candidate`, …). |
+| `pdf-tool assets in.pdf -o assets` | Images (original JPEG/PNG bytes when browser-usable, otherwise RGB(A) PNG), vector logos and icons (clean SVG from the path data + transparent 300 dpi PNG; identical icons merged), embedded font programs, all listed in `manifest.json` with ids, placements and an inferred role (`logo-candidate`, `icon`, …). |
 | `pdf-tool edit in.pdf --changes changes.json -o out.pdf [--report r.json]` | In-place edits: `replace_text` (search within a line, or a paragraph `rect`), `insert_text` (point or box), `redact`, `replace_image`, `remove_image`, `shift_content` (move everything below a line up/down to close or open space). Either every operation is applied or nothing is written. |
+| `pdf-tool scaffold in.pdf -o rebuild` | Editable HTML replica for reconstruction: every text line on its original baseline (per-style classes, embedded fonts via `@font-face`), boxes/rules as divs, other vectors as inline SVG, images with clip paths, links. Renders and measures itself, corrects baselines and letter/word spacing, and reports the remaining error. Paragraphs carry a ready `data-flow` recipe for rewriting them as flowing text. |
 | `pdf-tool generate doc.html -o out.pdf [--size-from in.pdf \| --page-size A4] [--margin 20mm] [--header-template h.html] [--footer-template f.html]` | HTML/CSS to PDF with headless Chromium: print CSS, page breaks, backgrounds, local images and fonts, tables. Page JS is off, the network is blocked, and only files under the HTML's folder (or `--root`) are served. |
 | `pdf-tool compare ref.pdf cand.pdf -o dir [--masks r.json] [--mask 1:x0,y0,x1,y1] [--expect T] [--forbid T]` | Side-by-side and diff PNGs, per-page SSIM, changed pixels and changed regions, word-level text diffs (per page and across the whole document), text-block moves measured on baselines, page size/count checks, and overflow warnings. Exits `1` if an `--expect`/`--forbid` check fails. |
 
@@ -70,6 +71,7 @@ Paths with spaces work. Existing files, including the input PDF, are never overw
     {"op": "replace_text", "page": 2, "rect": [56, 140, 539, 230], "text": "Rewritten paragraph…"},
     {"op": "insert_text", "page": 1, "point": [56, 780], "text": "Onaylandı", "size": 9, "color": "#666666"},
     {"op": "insert_text", "page": 1, "rect": [56, 700, 300, 760], "html": "<b>Note:</b> draft"},
+    {"op": "replace_text", "page": 1, "search": "Django", "runs": [{"text": "Django", "bold": true}]},
     {"op": "redact", "page": 3, "search": "Internal only", "fill": "#000000"},
     {"op": "replace_image", "page": 1, "asset_id": "img-12", "image": "new-logo.png"},
     {"op": "remove_image", "page": 1, "asset_id": "img-7"},
@@ -79,6 +81,11 @@ Paths with spaces work. Existing files, including the input PDF, are never overw
 ```
 
 How the edit engine behaves:
+- **Mixed styles.** New content is `text`, `runs` (explicit styled pieces) or simple `html`
+  (`<b>`, `<i>`, `<br>`, `<p>`, colour spans). Plain `text` takes its styles word by word from the
+  text it replaces, so a bold label stays bold. The report's `styled` field shows the result.
+  Bold and italic pieces use the document's own embedded bold/italic font when there is one.
+  Text is always set glyph by glyph in reading order (no ligatures), so it stays searchable.
 - **Removal is real redaction.** Characters are deleted from the content stream. By default
   the area is left transparent, so backgrounds survive. `fill` paints a box, and
   `remove_images`/`remove_graphics` widen the redaction.
@@ -194,8 +201,11 @@ src/pdf_tools/
   extract.py   Marker integration (lazy, cached models, OCR decision) + PyMuPDF fallback
   render.py    page rasterization
   assets.py    image / vector / font export with manifest
-  fonts.py     glyph-checked font resolution for edits
+  fonts.py     glyph-checked font resolution for edits (incl. embedded bold/italic siblings)
+  richtext.py  styled runs: simple HTML parsing, word-level style transfer, line layout
+  vector.py    PDF vector paths → SVG
   edit.py      edit schema + engine (Strategy A)
+  scaffold.py  editable, self-calibrating HTML replica (start of Strategy B)
   generate.py  Playwright/Chromium HTML→PDF with request sandbox (Strategy B)
   compare.py   visual + structural comparison
   cli.py       Typer CLI (thin wrapper; core functions return Pydantic models)
@@ -203,7 +213,7 @@ src/pdf_tools/
 
 The CLI only parses arguments and prints JSON. Each command is a plain function that returns a
 Pydantic model or dict (`inspect_pdf`, `extract`, `render_pdf`, `extract_assets`, `apply_edits`,
-`generate_pdf`, `compare_pdfs`), so an MCP adapter can wrap these functions directly later.
+`scaffold`, `generate_pdf`, `compare_pdfs`), so an MCP adapter can wrap these functions directly later.
 
 ## Known limitations
 
@@ -217,6 +227,11 @@ Pydantic model or dict (`inspect_pdf`, `extract`, `render_pdf`, `extract_assets`
 - **Search replacement** works inside one visual line. Text that spans lines needs a `rect`
   replacement. Editing rotated pages is refused. Inline images can only be replaced through
   `rect` (redact + insert).
+- **Scaffold fidelity.** Chromium places text baselines on a 0.75 pt pixel grid (up to 0.375 pt
+  off). Glyph spacing is corrected per line, but a line whose spacing is uneven in the source
+  (e.g. wide spaces around a separator) can keep up to ~2 pt of drift. Rotated text and
+  non-image clipping masks are not reproduced. Fonts that browsers can't load (bare CFF, Type 1,
+  Type 3) are replaced by metric-compatible system fonts.
 - **Tables, reading order, page background, vector-logo detection and OCR need are heuristics**
   (marked `provenance: inferred`). Reading order assumes a single column.
 - **Marker 2.0 OCR on macOS** needs `llama-server` (installed by `--with-ocr`). Without it, scanned

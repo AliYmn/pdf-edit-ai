@@ -55,7 +55,7 @@ Paths with spaces work. Existing files, including the input PDF, are never overw
 | `pdf-tool extract in.pdf --format markdown\|json\|html [-o dir]` | Marker extraction (headings, lists, tables, images, page-aware). PyMuPDF decides first whether OCR is needed (`--ocr auto\|force\|never`). Several PDFs per call reuse the loaded models. `--engine pymupdf` is a fast fallback that never OCRs. |
 | `pdf-tool render in.pdf --dpi 150 [-p 1-3] [-o dir]` | PNG per page (`page-001.png`, …). |
 | `pdf-tool assets in.pdf -o assets` | Images (original JPEG/PNG bytes when browser-usable, otherwise RGB(A) PNG), vector logos and icons (clean SVG from the path data + transparent 300 dpi PNG; identical icons merged), embedded font programs, all listed in `manifest.json` with ids, placements and an inferred role (`logo-candidate`, `icon`, …). |
-| `pdf-tool edit in.pdf --changes changes.json -o out.pdf [--report r.json]` | In-place edits: `replace_text` (search within a line, or a paragraph `rect`), `insert_text` (point or box), `redact`, `replace_image`, `remove_image`, `shift_content` (move everything below a line up/down to close or open space). Either every operation is applied or nothing is written. |
+| `pdf-tool edit in.pdf --changes changes.json -o out.pdf [--report r.json]` | In-place edits: `replace_text` (search within a line, or a paragraph `rect`), `insert_text` (point or box), `redact`, `replace_all` (every match across a page range, case-preserving), `replace_image`, `remove_image`, `swap_print` (replace a word or logo printed on a photo), `shift_content` (move everything below a line up/down to close or open space). Either every operation is applied or nothing is written. |
 | `pdf-tool scaffold in.pdf -o rebuild` | Editable HTML replica for reconstruction: every text line on its original baseline (per-style classes, embedded fonts via `@font-face`), boxes/rules as divs, other vectors as inline SVG, images with clip paths, links. Renders and measures itself, corrects baselines and letter/word spacing, and reports the remaining error. Paragraphs carry a ready `data-flow` recipe for rewriting them as flowing text. |
 | `pdf-tool generate doc.html -o out.pdf [--size-from in.pdf \| --page-size A4] [--margin 20mm] [--header-template h.html] [--footer-template f.html]` | HTML/CSS to PDF with headless Chromium: print CSS, page breaks, backgrounds, local images and fonts, tables. Page JS is off, the network is blocked, and only files under the HTML's folder (or `--root`) are served. |
 | `pdf-tool compare ref.pdf cand.pdf -o dir [--masks r.json] [--mask 1:x0,y0,x1,y1] [--expect T] [--forbid T]` | Side-by-side and diff PNGs, per-page SSIM, changed pixels and changed regions, word-level text diffs (per page and across the whole document), text-block moves measured on baselines, a per-image check (identical bytes / same pixels / changed / missing / added), page size/count checks, and overflow warnings. Exits `1` if an `--expect`/`--forbid` check fails. |
@@ -75,7 +75,10 @@ Paths with spaces work. Existing files, including the input PDF, are never overw
     {"op": "redact", "page": 3, "search": "Internal only", "fill": "#000000"},
     {"op": "replace_image", "page": 1, "asset_id": "img-12", "image": "new-logo.png"},
     {"op": "remove_image", "page": 1, "asset_id": "img-7"},
-    {"op": "shift_content", "page": 2, "y": 232, "dy": -21}
+    {"op": "shift_content", "page": 2, "y": 232, "dy": -21},
+    {"op": "replace_all", "pages": "1-10", "search": "yuasa", "text": "Uplus"},
+    {"op": "swap_print", "page": 1, "asset_id": "img-12",
+     "prints": [{"polygon": [[410, 220], [640, 205], [645, 270], [412, 286]], "text": "UPLUS", "old": "YUASA"}]}
   ]
 }
 ```
@@ -92,7 +95,11 @@ How the edit engine behaves:
 - **Search replacement works on visual lines** and ignores whitespace differences. Text objects
   that share a baseline and nearly touch are treated as one line. The rest of the line is re-set
   so spacing stays natural. `align: right|center` keeps the line's end or centre fixed. Use
-  `occurrence: n` to target one match.
+  `occurrence: n` to target one match. Justified lines keep both edges: the width change is
+  spread over the word gaps.
+- **`replace_all`** handles long documents: every match in a page range, case-insensitive by
+  default, written in the case of each match (YUASA → UPLUS, Yuasa → Uplus), several per line.
+  A 28-page manual's 37 matches on pages 1–10 took about 4 s.
 - **Paragraph replacement (`rect`)** puts the new text on the original first baseline and left
   edge, with the original line pitch, font, size and color. Alignment is inferred unless given.
   Plain text is set one glyph per character, without ligatures, so it stays searchable even with
@@ -123,7 +130,10 @@ The agent detects the images (`assets`: id, file, placements, pixel size, format
 colour space, effective DPI), edits a copy according to the user's prompt with Pillow/OpenCV,
 and puts it back with `replace_image`. Placement, clipping (round photo frames) and every page
 that shares the image are kept. The edit report confirms the placed pixels equal the new file,
-and `compare` with the report's masks proves no other image or text changed. Deterministic edits
+and `compare` with the report's masks proves no other image or text changed. For a word or logo
+printed on a photo (a brand on a product or packaging), `swap_print` does the edit itself: it
+finds the ink inside a polygon, measures its angle, size and colour, inpaints it away and draws
+the new text (with the old text's letter metrics) or logo in the same ink, perspective and blur. Deterministic edits
 (recolor, crop, grayscale, background removal, blurring a region, adding text, compositing a file
 you provide) work locally. Generative edits that invent new image content need an image
 model, which the toolkit does not include.

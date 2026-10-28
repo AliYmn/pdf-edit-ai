@@ -119,7 +119,8 @@ for body text) — switch that change to Strategy B.
     {"op": "redact", "page": 3, "search": "Internal use only"},
     {"op": "replace_image", "page": 1, "asset_id": "img-12", "image": "new-logo.png"},
     {"op": "remove_image", "page": 1, "asset_id": "img-7"},
-    {"op": "shift_content", "page": 2, "y": 232, "dy": -21}
+    {"op": "shift_content", "page": 2, "y": 232, "dy": -21},
+    {"op": "replace_all", "pages": "1-10", "search": "yuasa", "text": "Uplus", "overflow": "shrink"}
   ]
 }
 ```
@@ -160,6 +161,15 @@ Rules of the edit engine:
   up would overlap content, or when moving down would push content off the page. A rect
   `replace_text` reports `height_change` (e.g. `-21.0` = two 10.5 pt lines freed): run once
   without the shift, read it, then add `shift_content` with `dy` = `height_change`.
+- `replace_all` is for long documents (a brand or product name everywhere): every match in
+  `pages` (`"all"`, `"1-10"`, `"3,5-7"`), case-insensitive by default (`match_case`), written in
+  each match's case (`preserve_case`: YUASA → UPLUS, Yuasa → Uplus); several matches per line
+  are fine. Style fields (`overflow`, `font`, …) apply to every match. The report counts matches
+  per page, `verified` means the search text is gone from the range, and the masks cover
+  every changed line. Rotated pages are skipped with a warning. Text inside images (logos,
+  product photos) is not text: see 7–8A (images).
+- Justified lines keep both edges: the width change is spread over the word gaps after the
+  match (or before it, when the match ends the line), up to one space width per gap.
 - Editing rotated pages is refused — use Strategy B.
 
 ```bash
@@ -189,6 +199,26 @@ Check `verified` for every operation: `false` means the new text could not be re
    (or `remove_image`). Placement, clipping (e.g. a round photo frame) and every page that
    shares the image are kept/updated. In the report, `verified: true` means the placed pixels
    equal your file.
+   **Print on a photo** (a brand name or logo on a product, a label, packaging): use
+   `swap_print` instead of hand-editing. Coordinates are pixels of the exported image file;
+   pick the image by `asset_id`, `xref` or a page `rect`:
+   ```json
+   {"op": "swap_print", "page": 1, "asset_id": "img-12", "prints": [
+     {"polygon": [[410, 220], [640, 205], [645, 270], [412, 286]], "text": "UPLUS", "old": "YUASA"},
+     {"polygon": [[80, 40], [190, 40], [190, 90], [80, 90]], "logo": "brand/uplus-mark.png"}
+   ]}
+   ```
+   For each print the ink inside the polygon is separated from its surface (letter-shaped
+   parts mostly inside the polygon; neighbouring lines that only touch it stay), its rotated
+   box and ink colour are measured, it is inpainted away, and the new text (mapped with the
+   old text's letter metrics) or the logo's alpha in the ink colour is drawn into the same
+   box with matching blur. Options: `ink` `light`/`dark` (on a dark/light surface), `mode`
+   `shear` (print seen in perspective, default) or `rotate` (design printed at an angle),
+   `clip` (visible area, e.g. not behind a cutaway), `grow`/`stroke` (small blurry print looks
+   thinner than its box), `min_aspect` (the mark continues out of view), `font_file`.
+   Draw the polygon tightly around one mark only; check the message (angle, box, ink colour)
+   and look at the output at 2–3× zoom. The source format is kept (JPEG q95 / PNG with alpha);
+   every placement of the image changes.
 5. `compare --masks edit-report.json` lists each image as `identical` (same bytes), `same_pixels`
    (re-encoded), `changed` (with `pixel_diff`, `masked` = intended), `missing` or `added`.
    `status: ok` means only the intended images changed. Look at the side-by-side images.

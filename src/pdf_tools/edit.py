@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Annotated, Literal
 
+import numpy as np
 import pymupdf
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -23,6 +26,7 @@ from .common import (
     ensure_writable_output,
     hex_to_floats,
     open_pdf,
+    parse_pages,
     rnd,
 )
 from .fonts import ResolvedFont, resolve_font
@@ -184,8 +188,69 @@ class ShiftContent(_Op):
         return self
 
 
+class PrintItem(BaseModel):
+    """One printed mark to swap; coordinates are pixels of the image as exported by `pdf-tool assets`."""
+
+    model_config = ConfigDict(extra="forbid")
+    polygon: list[tuple[float, float]] = Field(min_length=3, description="Area around the old print (image pixels)")
+    text: str | None = Field(None, description="New text (needs 'old')")
+    old: str | None = Field(None, description="The printed text being replaced, for its letter metrics")
+    logo: str | None = Field(None, description="Image whose alpha is the new mark, tinted with the ink colour")
+    ink: Literal["light", "dark"] = "light"
+    mode: Literal["shear", "rotate"] = Field("shear", description="shear: print seen in perspective; rotate: printed at an angle")
+    clip: list[tuple[float, float]] | None = Field(None, description="Visible area, e.g. not behind a cutaway")
+    grow: float = Field(1.0, ge=0.5, le=2.0, description="Widen the box for small blurry print")
+    stroke: int = Field(0, ge=0, le=30, description="Extra text weight")
+    min_aspect: float | None = Field(None, gt=0, description="Extend a partly hidden mark to this width/height")
+    font_file: str | None = None
+
+    @model_validator(mode="after")
+    def _check(self):
+        if (self.text is None) == (self.logo is None):
+            raise ValueError("a print needs exactly one of 'text' or 'logo'")
+        if self.text is not None and not self.old:
+            raise ValueError("a text print needs 'old'")
+        return self
+
+
+class SwapPrint(_Op):
+    op: Literal["swap_print"]
+    xref: int | None = None
+    asset_id: str | None = Field(None, description="Asset id from inspect/assets, e.g. 'img-12'")
+    rect: BBox | None = Field(None, description="Pick the image overlapping this area most")
+    prints: list[PrintItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check(self):
+        if sum(x is not None for x in (self.xref, self.asset_id, self.rect)) != 1:
+            raise ValueError("swap_print needs exactly one of 'xref', 'asset_id' or 'rect'")
+        return self
+
+
+class ReplaceAll(_Style):
+    """Replace every occurrence across a page range (e.g. a brand name)."""
+
+    model_config = ConfigDict(extra="forbid")
+    op: Literal["replace_all"]
+    pages: str = Field("all", description="1-based page spec, e.g. '1-10' or 'all'")
+    search: str = Field(min_length=1)
+    text: str
+    match_case: bool = Field(False, description="false: 'Yuasa', 'YUASA' and 'yuasa' all match")
+    preserve_case: bool = Field(True, description="Write the new text in the case of each match (Uplus / UPLUS / uplus)")
+    page: int = Field(1, ge=1, description="(set automatically to the first page of the range)")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.search.lower() in self.text.lower():
+            raise ValueError("replace_all: the new text contains the search text (would never finish)")
+        if "\n" in self.text:
+            raise ValueError("replace_all writes within a line; no line breaks")
+        return self
+
+
 Operation = Annotated[
-    ReplaceText | InsertText | Redact | ReplaceImage | RemoveImage | InsertImage | ShiftContent, Field(discriminator="op")
+    ReplaceText | InsertText | Redact | ReplaceImage | RemoveImage | InsertImage | SwapPrint | ReplaceAll | ShiftContent,
+    Field(discriminator="op"),
 ]
 
 
@@ -319,8 +384,10 @@ def logical_lines(page: pymupdf.Page) -> list[dict]:
         row.sort(key=lambda it: it["bbox"].x0)
         cur = row[0]
         for it in row[1:]:
-            gap = it["bbox"].x0 - cur["bbox"].x1
-            if -0.5 <= gap < 0.6 * cur["size"]:  # wider gaps are columns or table cells
+            # after a space glyph (left out of line boxes) a justified word gap may be wide
+            space = cur["chars"][-1][0]["c"].isspace()
+            gap = it["bbox"].x0 - max(cur["bbox"].x1, cur["chars"][-1][0]["bbox"][2])
+            if -0.5 <= gap < (1.0 if space else 0.6) * cur["size"]:  # wider gaps are columns or table cells
                 last_c, last_s = cur["chars"][-1]
                 if gap > 0.15 * cur["size"] and not last_c["c"].isspace() and not it["chars"][0][0]["c"].isspace():
                     gap_box = (cur["bbox"].x1, last_c["bbox"][1], it["bbox"].x0, last_c["bbox"][3])
@@ -335,9 +402,16 @@ def logical_lines(page: pymupdf.Page) -> list[dict]:
     return merged
 
 
-def find_line_hits(page: pymupdf.Page, needle: str) -> list[_Hit]:
+def _fold(ch: str) -> str:
+    low = ch.lower()
+    return low if len(low) == 1 else ch  # keep 1:1 positions (e.g. Turkish 'İ' lowers to two code points)
+
+
+def find_line_hits(page: pymupdf.Page, needle: str, ignore_case: bool = False) -> list[_Hit]:
     """Whitespace-insensitive search within visual lines, keeping per-character geometry."""
     target = _norm_ws(needle)
+    if ignore_case:
+        target = "".join(_fold(c) for c in target)
     hits = []
     for line in logical_lines(page):
         chars = line["chars"]
@@ -349,6 +423,8 @@ def find_line_hits(page: pymupdf.Page, needle: str) -> list[_Hit]:
             norm.append(ch)
             idx.append(k)
         text = "".join(norm)
+        if ignore_case:
+            text = "".join(_fold(c) for c in text)
         pos = text.find(target)
         while pos >= 0:
             hits.append(_Hit(line["block"], line, chars, idx[pos], idx[pos + len(target) - 1] + 1))
@@ -411,9 +487,11 @@ class _PageGeometry:
 
 
 class _Ctx:
-    def __init__(self, doc: pymupdf.Document, base_dir: Path, font_dirs: tuple[str, ...]):
+    def __init__(self, doc: pymupdf.Document, base_dir: Path, font_dirs: tuple[str, ...], tmp: Path | None = None):
         self.doc, self.base_dir, self.font_dirs = doc, base_dir, font_dirs
         self.inserted_fonts = False
+        self.tmp = tmp  # scratch files that live until the output is verified
+        self.files: dict[int, Path] = {}  # op index -> file written into the PDF
 
     def path(self, p: str | None) -> str | None:
         if p is None:
@@ -535,7 +613,8 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
         line_x0 = h.chars[0][0]["bbox"][0]
         line_x1 = h.chars[-1][0]["bbox"][2]
         align = op.align if op.align in ("right", "center") else "left"
-        # a justified line keeps its right edge: the width change is spread over the following word gaps
+        # a justified line keeps its right edge: the width change is spread over the following word
+        # gaps, or over the preceding ones when the match ends the line
         def ink_right(chars) -> float:  # trailing spaces do not count
             return max((c["bbox"][2] for c in chars if not c["c"].isspace()), default=0.0)
 
@@ -543,13 +622,17 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
         while tail and tail[-1]["c"].isspace():
             tail = tail[:-1]
         trailing_spaces = sum(1 for c in tail if c["c"].isspace())
+        lead = [c for c, _ in h.chars[: h.start]]
+        while lead and lead[0]["c"].isspace():
+            lead = lead[1:]
+        n_sp = trailing_spaces or sum(1 for c in lead if c["c"].isspace())
         # column neighbours: lines starting at the same x within a few line heights (blocks may be split)
         x0, size = h.chars[0][0]["bbox"][0], h.chars[0][1]["size"]
         column = [ln for ln in page_lines if abs(ln["bbox"].x0 - x0) < 2 and abs(ln["y"] - h.line["y"]) < 6 * size]
         col_right = max(ink_right([c for c, _ in ln["chars"]]) for ln in column)
         has_next = any(0 < ln["y"] - h.line["y"] < 1.8 * size for ln in column)
         justified = (
-            align == "left" and trailing_spaces and len(column) >= 3 and has_next
+            align == "left" and n_sp and len(column) >= 3 and has_next
             and abs(ink_right([c for c, _ in h.chars]) - col_right) < 1.5
         )  # fmt: skip
         # subset fonts often lack a space glyph (justified PDFs position words instead)
@@ -562,9 +645,11 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
             shift_post = 0.0 if align == "right" else delta / 2 if align == "center" else delta
             new_x0 = line_x0 + shift_pre if h.start > 0 else x_start + shift_pre
             new_x1 = line_x1 + shift_post if h.end < len(h.chars) else x_start + shift_pre + new_w
-            distribute = bool(justified) and abs(delta) / trailing_spaces <= 0.6 * space_w
+            distribute = bool(justified) and abs(delta) / n_sp <= space_w
             if distribute:
                 new_x1 = line_x1
+                if not trailing_spaces:  # the match ends the line: the words before it make room
+                    shift_pre, shift_post, new_x0 = -delta, 0.0, line_x0
             fits = new_x0 >= left_lim - 0.5 and new_x1 <= right_lim + 0.5
             if fits or op.overflow == "allow":
                 if not fits:
@@ -578,12 +663,20 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
                 f"{left_lim:.1f}..{right_lim:.1f} (needs {new_w:.1f}pt, original {old_w:.1f}pt). "
                 "Shorten the text, use overflow 'shrink', or replace the whole paragraph with a rect."
             )
-        plans.append((h, pieces, (delta, shift_pre, shift_post, distribute, trailing_spaces), scale))
+        plans.append((h, pieces, (delta, shift_pre, shift_post, distribute, n_sp), scale))
 
     for h, pieces, (delta, shift_pre, shift_post, distribute, n_sp), scale in plans:
         moved: list[tuple[int, int, list[float]]] = []  # char ranges to rewrite, with a shift per char
         if abs(delta) > 0.05:
-            if shift_pre and h.start > 0:
+            if shift_pre and h.start > 0 and distribute:
+                shifts, passed, seen = [], 0, False
+                for c, _ in h.chars[: h.start]:  # a space moves with the word before it; indentation does not stretch
+                    shifts.append(shift_pre * passed / n_sp)
+                    if c["c"].isspace():
+                        passed += seen
+                    seen = seen or not c["c"].isspace()
+                moved.append((0, h.start, shifts))
+            elif shift_pre and h.start > 0:
                 moved.append((0, h.start, [shift_pre] * h.start))
             if h.end < len(h.chars) and distribute:
                 shifts, passed = [], 0
@@ -623,8 +716,9 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
                         res.warnings.append(msg)
                     # letter by letter at the original positions: keeps the producer's tracking/kerning
                     tw = pymupdf.TextWriter(page.rect)
+                    keep_spaces = seg_font.font.has_glyph(32)  # word gaps stay real spaces for search/extraction
                     for c, _ in h.chars[k:j]:
-                        if not c["c"].isspace():
+                        if not c["c"].isspace() or (c["c"] == " " and keep_spaces):
                             rect, _ = tw.append((c["origin"][0] + shift, c["origin"][1]), c["c"], font=seg_font.font, fontsize=st["size"])
                             written |= rect
                     tw.write_text(page, color=_rgb(st["color"]))
@@ -839,6 +933,97 @@ def _insert_image(ctx: _Ctx, page, op: InsertImage, res: OpResult) -> None:
     res.rects.append(rnd(box))
 
 
+def _image_xref(ctx: _Ctx, page, op) -> tuple[int, list]:
+    """xref and all placements (page, rect) of the image an op points at."""
+    if op.rect is not None:
+        target = pymupdf.Rect(op.rect)
+        scored = [(abs(pymupdf.Rect(i["bbox"]) & target), i) for i in page.get_image_info(xrefs=True)]
+        scored = [s for s in scored if s[0] > 0]
+        if not scored:
+            raise PdfToolError("no image overlaps rect")
+        xref = max(scored, key=lambda s: s[0])[1]["xref"]
+    else:
+        xref = op.xref if op.xref is not None else _xref_from_asset(op.asset_id)
+    if not xref:
+        raise PdfToolError("inline images cannot be edited in place; use remove_image + insert_image")
+    placements = [(p, pymupdf.Rect(i["bbox"])) for p in ctx.doc for i in p.get_image_info(xrefs=True) if i["xref"] == xref]
+    if not any(p.number == page.number for p, _ in placements):
+        raise PdfToolError(f"image xref {xref} is not placed on page {op.page}")
+    return xref, placements
+
+
+def _swap_print(ctx: _Ctx, page, op: SwapPrint, res: OpResult) -> None:
+    from PIL import Image
+
+    from .compare import _image_pixels
+    from .printswap import PrintSpec, swap_print
+
+    xref, placements = _image_xref(ctx, page, op)
+    box = next(b for p, b in placements if p.number == page.number)
+    arr = _image_pixels(ctx.doc, page, xref, box)
+    rgb, alpha = np.ascontiguousarray(arr[..., :3]), (arr[..., 3] if arr.shape[2] == 4 else None)
+    infos = []
+    for item in op.prints:
+        spec = PrintSpec(**{**item.model_dump(), "logo": ctx.path(item.logo), "font_file": ctx.path(item.font_file)})
+        rgb, info = swap_print(rgb, spec)
+        infos.append(info)
+    jpeg = alpha is None and "DCT" in str(ctx.doc.xref_get_key(xref, "Filter")[1])
+    path = ctx.tmp / f"swap-{res.index}-{xref}.{'jpg' if jpeg else 'png'}"
+    if jpeg:
+        Image.fromarray(rgb).save(path, quality=95, subsampling=0)  # keep the photo's format
+    else:
+        Image.fromarray(np.dstack([rgb, alpha]) if alpha is not None else rgb).save(path)
+    page.replace_image(xref, filename=str(path))
+    ctx.files[res.index] = path
+    res.rects += [rnd(b) for p, b in placements if p.number == page.number]
+    res.other_pages += [{"page": p.number + 1, "rect": rnd(b)} for p, b in placements if p.number != page.number]
+    res.message = "; ".join(f"angle {i['angle']}°, box {i['size']}, ink {i['ink_color']}" for i in infos)
+
+
+def _case_like(matched: str, new: str) -> str:
+    if matched.isupper():
+        return new.upper()
+    if matched.islower():
+        return new.lower()
+    if matched[:1].isupper() and matched[1:].islower():
+        return new[:1].upper() + new[1:].lower()
+    return new
+
+
+def _replace_all(ctx: _Ctx, op: ReplaceAll, res: OpResult) -> None:
+    """Repeated single replacements (re-reading the page each time, so several matches on
+    one line and shifted text are always handled with fresh geometry)."""
+    style = {k: getattr(op, k) for k in _Style.model_fields}
+    per_page: dict[int, int] = {}
+    for i in parse_pages(op.pages, ctx.doc.page_count):
+        page = ctx.doc[i]
+        if page.rotation:
+            res.warnings.append(f"page {i + 1} is rotated and was skipped")
+            continue
+        for _ in range(1000):
+            hits = find_line_hits(page, op.search, ignore_case=not op.match_case)
+            if not hits:
+                break
+            h = hits[0]
+            matched = _norm_ws("".join(c["c"] for c, _ in h.chars[h.start : h.end]))
+            new = _case_like(matched, op.text) if op.preserve_case else op.text
+            sub = ReplaceText(op="replace_text", page=i + 1, search=matched, occurrence=1, text=new, **style)
+            sub_res = OpResult(index=res.index, op="replace_text", page=i + 1, status="applied")
+            try:
+                _replace_inline(ctx, page, sub, sub_res)
+            except PdfToolError as exc:
+                raise PdfToolError(f"page {i + 1}, {matched!r}: {exc}") from exc
+            res.other_pages += [{"page": i + 1, "rect": r} for r in sub_res.rects]
+            res.warnings += [w for w in sub_res.warnings if w not in res.warnings]
+            per_page[i + 1] = per_page.get(i + 1, 0) + 1
+        else:
+            raise PdfToolError(f"page {i + 1}: too many matches")
+    total = sum(per_page.values())
+    res.message = f"replaced {total} occurrence(s): " + ", ".join(f"p{p}: {n}" for p, n in per_page.items())
+    if not total:
+        res.warnings.append(f"{op.search!r} not found in pages {op.pages}")
+
+
 def _remove_image(ctx: _Ctx, page, op: RemoveImage, res: OpResult) -> None:
     """Delete image placements on this page (content-stream removal, not a cover-up)."""
     infos = page.get_image_info(xrefs=True)
@@ -941,8 +1126,20 @@ def _xref_from_asset(asset_id: str) -> int:
     return int(m.group(1))
 
 
-def _verify(doc: pymupdf.Document, op, res: OpResult, base: Path) -> None:
+def _verify(doc: pymupdf.Document, op, res: OpResult, base: Path, files: dict[int, Path] | None = None) -> None:
     page = doc[op.page - 1]
+    if isinstance(op, ReplaceAll):
+        left = [i + 1 for i in parse_pages(op.pages, doc.page_count)
+                if find_line_hits(doc[i], op.search, ignore_case=not op.match_case)]  # fmt: skip
+        res.verified = not left
+        if left:
+            res.warnings.append(f"{op.search!r} still found on pages {left}")
+        return
+    if isinstance(op, SwapPrint) and files and res.index in files and res.rects:
+        res.verified = _placed_matches_file(doc, page, pymupdf.Rect(res.rects[0]), files[res.index])
+        if not res.verified:
+            res.warnings.append("the image placed in the output does not match the edited pixels")
+        return
     if isinstance(op, (ReplaceText, InsertText)) and res.rects:
         expected = "".join(t for t, _ in styled_input(op))
         area = _union(res.rects) + (-2, -2, 2, 2)
@@ -971,7 +1168,6 @@ def _resolve(base: Path, p: str) -> Path:
 
 def _placed_matches_file(doc: pymupdf.Document, page, box: pymupdf.Rect, path: Path) -> bool:
     """Decoded pixels of the image placed at ``box`` equal the file's (JPEG decoders may differ by a level)."""
-    import numpy as np
     from PIL import Image
 
     from .compare import _image_pixels
@@ -1007,6 +1203,10 @@ def _dispatch(ctx: _Ctx, page, op, res: OpResult) -> None:
         _remove_image(ctx, page, op, res)
     elif isinstance(op, InsertImage):
         _insert_image(ctx, page, op, res)
+    elif isinstance(op, SwapPrint):
+        _swap_print(ctx, page, op, res)
+    elif isinstance(op, ReplaceAll):
+        _replace_all(ctx, op, res)
     elif isinstance(op, ShiftContent):
         _shift_content(ctx, page, op, res)
     else:
@@ -1025,9 +1225,13 @@ def apply_edits(
     else:
         cs, base = load_changes(changes)
     ensure_writable_output(output, [pdf], overwrite)
+    for op in cs.operations:  # a replace_all reports under the first page of its range
+        if isinstance(op, ReplaceAll):
+            op.page = 1 if op.pages.strip().lower() == "all" else int(re.match(r"\s*(\d+)", op.pages).group(1))
     doc = open_pdf(pdf)
+    tmp = Path(tempfile.mkdtemp(prefix="pdf-tool-edit-"))
     try:
-        ctx = _Ctx(doc, base, tuple(str(Path(d).expanduser()) for d in cs.font_dirs))
+        ctx = _Ctx(doc, base, tuple(str(Path(d).expanduser()) for d in cs.font_dirs), tmp)
         results: list[OpResult] = []
         # shifts run last so every other operation can use original-page coordinates
         order = sorted(range(len(cs.operations)), key=lambda k: isinstance(cs.operations[k], ShiftContent))
@@ -1056,15 +1260,15 @@ def apply_edits(
         with atomic_output(output) as tmp:
             # deflate also losslessly compresses images stored uncompressed (pixels unchanged, bytes differ)
             doc.save(tmp, garbage=3, deflate=True)
+        out_doc = open_pdf(output)
+        try:
+            for op, res in zip(cs.operations, report.results):
+                _verify(out_doc, op, res, base, ctx.files)
+        finally:
+            out_doc.close()
     finally:
         doc.close()
-
-    out_doc = open_pdf(output)
-    try:
-        for op, res in zip(cs.operations, report.results):
-            _verify(out_doc, op, res, base)
-    finally:
-        out_doc.close()
+        shutil.rmtree(tmp, ignore_errors=True)
     report.output = str(output.resolve())
     for r in report.results:
         refs = r.reference_rects or r.rects

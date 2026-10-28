@@ -12,10 +12,12 @@ Pixel metrics alone cannot judge intentional edits, so the report combines:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -58,6 +60,22 @@ class BlockChange(BaseModel):
     dh: float | None = Field(None, description="Change of first-to-last baseline distance (line count/leading)")
 
 
+class ImageChange(BaseModel):
+    """One image on the page, matched between reference and candidate."""
+
+    status: Literal["identical", "same_pixels", "changed", "missing", "added"] = Field(
+        description="identical: same bytes; same_pixels: re-encoded, pixels equal; changed: pixels differ"
+    )
+    reference_bbox: BBox | None = None
+    candidate_bbox: BBox | None = None
+    reference_size: tuple[int, int] | None = Field(None, description="Pixels")
+    candidate_size: tuple[int, int] | None = None
+    moved: bool = Field(False, description="Placement differs by more than the tolerance")
+    pixel_diff: float | None = Field(None, description="Mean absolute difference 0..1 (same pixel size only)")
+    masked: bool = Field(False, description="Inside a mask: an intended change")
+    inline: bool = Field(False, description="Inline image (inside the content stream): compared by pixels only")
+
+
 class PageComparison(BaseModel):
     page: int
     reference_size: tuple[float, float] | None = None
@@ -72,6 +90,7 @@ class PageComparison(BaseModel):
     moved_blocks: list[BlockChange] = []
     missing_blocks: list[BlockChange] = []
     added_blocks: list[BlockChange] = []
+    images: list[ImageChange] = []
     warnings: list[str] = []
     side_by_side: str | None = None
     diff_image: str | None = None
@@ -284,6 +303,89 @@ def _match_blocks(ra, rb, tol: float, shifts: list[Shift] = ()):
     return moved[:MAX_ITEMS], unmatched_a[:MAX_ITEMS], added[:MAX_ITEMS]
 
 
+def _image_pixels(doc: pymupdf.Document, page: pymupdf.Page, xref: int, bbox: pymupdf.Rect) -> np.ndarray:
+    """Decoded RGB(A) pixels of an image object (soft mask applied); inline images are rendered."""
+    if not xref:
+        pix = page.get_pixmap(clip=bbox, dpi=150, alpha=False)
+    else:
+        pix = pymupdf.Pixmap(doc, xref)
+        if pix.alpha:
+            pix = pymupdf.Pixmap(pix, 0)
+        if pix.colorspace is None or pix.colorspace.n != 3:
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        kind, value = doc.xref_get_key(xref, "SMask")
+        if kind == "xref":
+            mask = pymupdf.Pixmap(doc, int(value.split()[0]))
+            if (mask.width, mask.height) == (pix.width, pix.height):
+                pix = pymupdf.Pixmap(pix, mask)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+
+
+def _page_images(doc: pymupdf.Document, page: pymupdf.Page) -> list[dict]:
+    out = []
+    for info in page.get_image_info(xrefs=True):
+        bbox = pymupdf.Rect(info["bbox"]) & page.rect
+        if bbox.is_empty:
+            continue
+        xref = info.get("xref", 0)
+        arr = _image_pixels(doc, page, xref, bbox)
+        raw = doc.xref_stream_raw(xref) if xref else None
+        out.append({
+            "bbox": bbox, "arr": arr, "size": (arr.shape[1], arr.shape[0]),
+            "pix": hashlib.sha256(arr.tobytes() + str(arr.shape).encode()).hexdigest(),
+            "raw": hashlib.sha256(raw).hexdigest() if raw else None, "inline": not xref,
+        })  # fmt: skip
+    return out
+
+
+def _match_images(ra: list[dict], rb: list[dict], ref_masks, shifts: list[Shift], tol: float, cand_masks=()) -> list[ImageChange]:
+    """Same pixels first (wherever they moved), then by placement overlap."""
+    out: list[ImageChange] = []
+    used: set[int] = set()
+
+    def expected(r: pymupdf.Rect) -> pymupdf.Rect:
+        dy = sum(sh.dy for sh in shifts if r.y0 >= sh.y - 0.5)
+        return r + (0, dy, 0, dy)
+
+    def moved(a: pymupdf.Rect, b: pymupdf.Rect) -> bool:
+        e = expected(a)
+        return max(abs(e.x0 - b.x0), abs(e.y0 - b.y0), abs(e.x1 - b.x1), abs(e.y1 - b.y1)) > tol
+
+    pending = []
+    for a in ra:
+        same = [(j, b) for j, b in enumerate(rb) if j not in used and b["pix"] == a["pix"]]
+        if same:
+            j, b = min(same, key=lambda t: abs(expected(a["bbox"]).tl - t[1]["bbox"].tl))
+            used.add(j)
+            status = "identical" if a["raw"] and a["raw"] == b["raw"] else "same_pixels"
+            out.append(ImageChange(status=status, reference_bbox=rnd(a["bbox"]), candidate_bbox=rnd(b["bbox"]),
+                                   reference_size=a["size"], candidate_size=b["size"], inline=a["inline"],
+                                   moved=moved(a["bbox"], b["bbox"])))  # fmt: skip
+        else:
+            pending.append(a)
+    for a in pending:
+        e = expected(a["bbox"])
+        overlap = [(abs(e & b["bbox"]) / (abs(e | b["bbox"]) or 1), j, b) for j, b in enumerate(rb) if j not in used]
+        overlap = [o for o in overlap if o[0] > 0.3]
+        masked = _in_masks(a["bbox"], ref_masks)
+        if not overlap:
+            out.append(ImageChange(status="missing", reference_bbox=rnd(a["bbox"]), reference_size=a["size"], masked=masked))
+            continue
+        _, j, b = max(overlap, key=lambda o: o[0])
+        used.add(j)
+        diff = None
+        if a["arr"].shape == b["arr"].shape:
+            diff = round(float(np.abs(a["arr"].astype(np.int16) - b["arr"].astype(np.int16)).mean() / 255), 4)
+        out.append(ImageChange(status="changed", reference_bbox=rnd(a["bbox"]), candidate_bbox=rnd(b["bbox"]),
+                               reference_size=a["size"], candidate_size=b["size"], moved=moved(a["bbox"], b["bbox"]),
+                               pixel_diff=diff, masked=masked))  # fmt: skip
+    for j, b in enumerate(rb):
+        if j not in used:
+            out.append(ImageChange(status="added", candidate_bbox=rnd(b["bbox"]), candidate_size=b["size"],
+                                   masked=_in_masks(b["bbox"], cand_masks)))  # fmt: skip
+    return out
+
+
 def _layout_warnings(page: pymupdf.Page, ref_page: pymupdf.Page | None) -> list[str]:
     warnings = []
     W, H = page.rect.width, page.rect.height
@@ -367,7 +469,9 @@ def compare_pdfs(
                 pc.reference_size = rnd((pa.rect.width, pa.rect.height))
             if pb:
                 pc.candidate_size = rnd((pb.rect.width, pb.rect.height))
-                pc.warnings += _layout_warnings(pb, pa)
+                # only problems the candidate introduced; the reference's own quirks are not regressions
+                known = set(_layout_warnings(pa, None)) if pa else set()
+                pc.warnings += [w for w in _layout_warnings(pb, pa) if w not in known]
             if pa and pb:
                 if abs(pa.rect.width - pb.rect.width) > 0.5 or abs(pa.rect.height - pb.rect.height) > 0.5:
                     pc.warnings.append(f"page size differs: reference {pc.reference_size} vs candidate {pc.candidate_size} pt")
@@ -387,6 +491,7 @@ def compare_pdfs(
                 pc.missing_text, pc.added_text, pc.text_similarity = _phrases([w[4] for w in wa], [w[4] for w in wb])
                 pc.missing_text, pc.added_text = pc.missing_text[:MAX_ITEMS], pc.added_text[:MAX_ITEMS]
                 pc.moved_blocks, pc.missing_blocks, pc.added_blocks = _match_blocks(_blocks(pa, pm), _blocks(pb, cm), tolerance, psh)
+                pc.images = _match_images(_page_images(da, pa), _page_images(db, pb), pm, psh, tolerance, cm)
             elif pa:
                 pc.warnings.append("page missing in candidate")
             else:
@@ -416,6 +521,7 @@ def compare_pdfs(
     review = (
         warnings or doc_missing or any(not e.ok for e in expectations)
         or any(p.warnings or p.missing_blocks or p.moved_blocks or (p.changed_pixels or 0) > 0.002 for p in pages)
+        or any(not im.masked and (im.moved or im.status in ("changed", "missing", "added")) for p in pages for im in p.images)
     )  # fmt: skip
     report = ComparisonReport(
         reference=str(Path(reference).resolve()),

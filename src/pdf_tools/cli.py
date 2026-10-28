@@ -261,6 +261,11 @@ def compare(
                 "text_similarity": p.text_similarity,
                 "moved_blocks": len(p.moved_blocks),
                 "missing_blocks": len(p.missing_blocks),
+                "images": [
+                    f"{im.status}{' (moved)' if im.moved else ''}{' (masked)' if im.masked else ''}"
+                    f" {im.reference_bbox or im.candidate_bbox}" + (f" diff={im.pixel_diff}" if im.pixel_diff is not None else "")
+                    for im in p.images
+                ],
                 "warnings": p.warnings,
                 "side_by_side": p.side_by_side,
                 "diff": p.diff_image,

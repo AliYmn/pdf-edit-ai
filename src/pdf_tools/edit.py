@@ -162,6 +162,13 @@ class RemoveImage(_Op):
         return self
 
 
+class InsertImage(_Op):
+    op: Literal["insert_image"]
+    rect: BBox = Field(description="Target area; the image is centred in it when keeping proportions")
+    image: str = Field(description="Image file (relative to the changes file)")
+    keep_proportion: bool = True
+
+
 class ShiftContent(_Op):
     """Move everything at or below ``y`` by ``dy`` points. Runs after all other
     operations; coordinates always refer to the original page."""
@@ -178,7 +185,7 @@ class ShiftContent(_Op):
 
 
 Operation = Annotated[
-    ReplaceText | InsertText | Redact | ReplaceImage | RemoveImage | ShiftContent, Field(discriminator="op")
+    ReplaceText | InsertText | Redact | ReplaceImage | RemoveImage | InsertImage | ShiftContent, Field(discriminator="op")
 ]
 
 
@@ -203,6 +210,7 @@ class OpResult(BaseModel):
     )
     rects: list[BBox] = Field([], description="Changed areas in the output")
     reference_rects: list[BBox] = Field([], description="Matching areas in the input when they differ (rect replace)")
+    other_pages: list[dict] = Field([], description="Areas changed on other pages (shared image objects)")
     verified: bool | None = None
     warnings: list[str] = []
 
@@ -312,7 +320,7 @@ def logical_lines(page: pymupdf.Page) -> list[dict]:
         cur = row[0]
         for it in row[1:]:
             gap = it["bbox"].x0 - cur["bbox"].x1
-            if -0.5 <= gap < 1.5 * cur["size"]:
+            if -0.5 <= gap < 0.6 * cur["size"]:  # wider gaps are columns or table cells
                 last_c, last_s = cur["chars"][-1]
                 if gap > 0.15 * cur["size"] and not last_c["c"].isspace() and not it["chars"][0][0]["c"].isspace():
                     gap_box = (cur["bbox"].x1, last_c["bbox"][1], it["bbox"].x0, last_c["bbox"][3])
@@ -420,6 +428,8 @@ class _Fonts:
     def __init__(self, ctx: _Ctx, page, op: _Style, res: OpResult):
         self.ctx, self.page, self.op, self.res = ctx, page, op, res
         self.cache: dict[Style, ResolvedFont] = {}
+        self.embolden: dict[Style, float] = {}  # stroke width (x font size) for faux bold
+        self.page_fonts: dict[int, str] = {}
 
     def prepare(self, pieces: list[Piece]) -> None:
         texts: dict[Style, str] = {}
@@ -434,6 +444,11 @@ class _Fonts:
                 )  # fmt: skip
                 self.cache[st] = rf
                 self.res.warnings += [w for w in rf.warnings if w not in self.res.warnings]
+                heavy = st.font and any(w in st.font.lower() for w in ("black", "heavy", "ultra", "extrabold"))
+                if heavy and rf.source != "original-embedded" and rf.buffer:
+                    # a black/heavy face replaced by a lighter bold: thicken it (measured ink density match)
+                    self.embolden[st] = 0.04
+                    self.res.warnings.append(f"'{st.font}' substituted by {rf.label}, emboldened to match its weight")
         self.ctx.inserted_fonts = True  # every rewrite embeds a font program; subset on save
 
     def width(self, text: str, st: Style, scale: float = 1.0) -> float:
@@ -452,6 +467,20 @@ def _write_placements(page, placements: list[Placement], fonts: _Fonts, scale: f
     tw, color = None, None
     for pl in placements:
         if not pl.text.strip():
+            continue
+        bw = fonts.embolden.get(pl.style)
+        if bw:  # fill + stroke text (TextWriter cannot stroke)
+            if tw is not None:
+                tw.write_text(page, color=_rgb(color)); tw = None
+            rf = fonts.cache[pl.style]
+            name = fonts.page_fonts.setdefault(id(rf), f"FB{len(fonts.page_fonts)}{page.number}")
+            page.insert_font(fontname=name, fontbuffer=rf.buffer)
+            rgb = _rgb(pl.style.color)
+            size = pl.style.size * scale
+            page.insert_text((pl.x, pl.y), pl.text, fontsize=size, fontname=name, color=rgb, fill=rgb,
+                             render_mode=2, border_width=bw)
+            w = rf.font.text_length(pl.text, size)
+            area |= pymupdf.Rect(pl.x, pl.y - rf.font.ascender * size, pl.x + w, pl.y - rf.font.descender * size)
             continue
         if tw is None or pl.style.color != color:
             if tw is not None:
@@ -485,6 +514,7 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
     # Process right-to-left / bottom-up so earlier hits keep valid geometry.
     hits.sort(key=lambda h: (h.line["bbox"][1], h.chars[h.start][0]["bbox"][0]), reverse=True)
     geo = _PageGeometry(page)
+    page_lines = logical_lines(page)
     fonts = _Fonts(ctx, page, op, res)
     plans = []
     for h in hits:
@@ -505,6 +535,25 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
         line_x0 = h.chars[0][0]["bbox"][0]
         line_x1 = h.chars[-1][0]["bbox"][2]
         align = op.align if op.align in ("right", "center") else "left"
+        # a justified line keeps its right edge: the width change is spread over the following word gaps
+        def ink_right(chars) -> float:  # trailing spaces do not count
+            return max((c["bbox"][2] for c in chars if not c["c"].isspace()), default=0.0)
+
+        tail = [c for c, _ in h.chars[h.end :]]
+        while tail and tail[-1]["c"].isspace():
+            tail = tail[:-1]
+        trailing_spaces = sum(1 for c in tail if c["c"].isspace())
+        # column neighbours: lines starting at the same x within a few line heights (blocks may be split)
+        x0, size = h.chars[0][0]["bbox"][0], h.chars[0][1]["size"]
+        column = [ln for ln in page_lines if abs(ln["bbox"].x0 - x0) < 2 and abs(ln["y"] - h.line["y"]) < 6 * size]
+        col_right = max(ink_right([c for c, _ in ln["chars"]]) for ln in column)
+        has_next = any(0 < ln["y"] - h.line["y"] < 1.8 * size for ln in column)
+        justified = (
+            align == "left" and trailing_spaces and len(column) >= 3 and has_next
+            and abs(ink_right([c for c, _ in h.chars]) - col_right) < 1.5
+        )  # fmt: skip
+        # subset fonts often lack a space glyph (justified PDFs position words instead)
+        space_w = max(fonts.width(" ", pieces[0][1]), 0.25 * pieces[0][1].size)
         scale = 1.0
         while True:
             new_w = sum(fonts.width(t, st, scale) for t, st in pieces)
@@ -513,6 +562,9 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
             shift_post = 0.0 if align == "right" else delta / 2 if align == "center" else delta
             new_x0 = line_x0 + shift_pre if h.start > 0 else x_start + shift_pre
             new_x1 = line_x1 + shift_post if h.end < len(h.chars) else x_start + shift_pre + new_w
+            distribute = bool(justified) and abs(delta) / trailing_spaces <= 0.6 * space_w
+            if distribute:
+                new_x1 = line_x1
             fits = new_x0 >= left_lim - 0.5 and new_x1 <= right_lim + 0.5
             if fits or op.overflow == "allow":
                 if not fits:
@@ -526,15 +578,21 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
                 f"{left_lim:.1f}..{right_lim:.1f} (needs {new_w:.1f}pt, original {old_w:.1f}pt). "
                 "Shorten the text, use overflow 'shrink', or replace the whole paragraph with a rect."
             )
-        plans.append((h, pieces, (delta, shift_pre, shift_post), scale))
+        plans.append((h, pieces, (delta, shift_pre, shift_post, distribute, trailing_spaces), scale))
 
-    for h, pieces, (delta, shift_pre, shift_post), scale in plans:
-        moved: list[tuple[int, int, float]] = []  # (from, to, shift) char ranges that must be rewritten
+    for h, pieces, (delta, shift_pre, shift_post, distribute, n_sp), scale in plans:
+        moved: list[tuple[int, int, list[float]]] = []  # char ranges to rewrite, with a shift per char
         if abs(delta) > 0.05:
             if shift_pre and h.start > 0:
-                moved.append((0, h.start, shift_pre))
-            if shift_post and h.end < len(h.chars):
-                moved.append((h.end, len(h.chars), shift_post))
+                moved.append((0, h.start, [shift_pre] * h.start))
+            if h.end < len(h.chars) and distribute:
+                shifts, passed = [], 0
+                for c, _ in h.chars[h.end :]:
+                    passed += c["c"].isspace()
+                    shifts.append(delta * max(0.0, 1 - passed / n_sp))
+                moved.append((h.end, len(h.chars), shifts))
+            elif shift_post and h.end < len(h.chars):
+                moved.append((h.end, len(h.chars), [shift_post] * (len(h.chars) - h.end)))
         redact_idx = [(h.start, h.end)] + [(a, b) for a, b, _ in moved]
         rects = [_union(c["bbox"] for c, _ in h.chars[a:b]) for a, b in redact_idx]
         y = h.chars[h.start][0]["origin"][1]
@@ -545,13 +603,13 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
             placements.append(Placement(x, y, text, st))
             x += fonts.width(text, st, scale)
         written = _write_placements(page, placements, fonts, scale)
-        for a, b, shift in moved:
-            # rewrite untouched neighbours span by span, shifted horizontally
+        for a, b, shifts in moved:
+            # rewrite untouched neighbours span by span (and shift by shift), moved horizontally
             k = a
             while k < b:
-                span = h.chars[k][1]
+                span, shift = h.chars[k][1], shifts[k - a]
                 j = k
-                while j < b and h.chars[j][1] is span:
+                while j < b and h.chars[j][1] is span and abs(shifts[j - a] - shift) < 1e-6:
                     j += 1
                 seg = "".join(c["c"] for c, _ in h.chars[k:j])
                 if seg.strip():
@@ -563,11 +621,13 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
                     if seg_font.source != "original-embedded":
                         msg = f"neighbouring text {seg.strip()!r} re-set in {seg_font.label} (original font not reusable)"
                         res.warnings.append(msg)
-                    c0 = h.chars[k][0]
+                    # letter by letter at the original positions: keeps the producer's tracking/kerning
                     tw = pymupdf.TextWriter(page.rect)
-                    rect, _ = tw.append((c0["origin"][0] + shift, c0["origin"][1]), seg, font=seg_font.font, fontsize=st["size"])
+                    for c, _ in h.chars[k:j]:
+                        if not c["c"].isspace():
+                            rect, _ = tw.append((c["origin"][0] + shift, c["origin"][1]), c["c"], font=seg_font.font, fontsize=st["size"])
+                            written |= rect
                     tw.write_text(page, color=_rgb(st["color"]))
-                    written |= rect
                 k = j
         res.rects.append(rnd(_union(rects) | written))
         if scale < 1:
@@ -756,7 +816,27 @@ def _replace_image(ctx: _Ctx, page, op: ReplaceImage, res: OpResult) -> None:
     if len(pages) > 1 or len(placements) > 1:
         res.warnings.append(f"image object is shared; replaced at {len(placements)} placements on pages {pages}")
     res.rects += [rnd(b) for p, b in placements if p.number == page.number]
+    res.other_pages += [{"page": p.number + 1, "rect": rnd(b)} for p, b in placements if p.number != page.number]
     res.message = f"replaced xref {xref}"
+
+
+def _insert_image(ctx: _Ctx, page, op: InsertImage, res: OpResult) -> None:
+    from PIL import Image
+
+    path = Path(ctx.path(op.image))
+    if not path.is_file():
+        raise PdfToolError(f"image not found: {path}")
+    with Image.open(path) as im:
+        w, h = im.size
+    box = pymupdf.Rect(op.rect) & page.rect
+    if box.is_empty:
+        raise PdfToolError("rect is empty or outside the page")
+    page.insert_image(box, filename=str(path), keep_proportion=op.keep_proportion)
+    if op.keep_proportion:  # the placed area actually used
+        s = min(box.width / w, box.height / h)
+        cx, cy = (box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2
+        box = pymupdf.Rect(cx - w * s / 2, cy - h * s / 2, cx + w * s / 2, cy + h * s / 2)
+    res.rects.append(rnd(box))
 
 
 def _remove_image(ctx: _Ctx, page, op: RemoveImage, res: OpResult) -> None:
@@ -861,7 +941,7 @@ def _xref_from_asset(asset_id: str) -> int:
     return int(m.group(1))
 
 
-def _verify(doc: pymupdf.Document, op, res: OpResult) -> None:
+def _verify(doc: pymupdf.Document, op, res: OpResult, base: Path) -> None:
     page = doc[op.page - 1]
     if isinstance(op, (ReplaceText, InsertText)) and res.rects:
         expected = "".join(t for t, _ in styled_input(op))
@@ -878,6 +958,42 @@ def _verify(doc: pymupdf.Document, op, res: OpResult) -> None:
     elif isinstance(op, RemoveImage):
         left = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()]
         res.verified = not any(abs(r & pymupdf.Rect(b)) > 0.5 * abs(pymupdf.Rect(b)) for r in left for b in res.rects)
+    elif isinstance(op, (ReplaceImage, InsertImage)) and res.rects:
+        res.verified = _placed_matches_file(doc, page, pymupdf.Rect(res.rects[0]), _resolve(base, op.image))
+        if not res.verified:
+            res.warnings.append("the image placed in the output does not match the new file pixel for pixel")
+
+
+def _resolve(base: Path, p: str) -> Path:
+    q = Path(p).expanduser()
+    return q if q.is_absolute() else base / q
+
+
+def _placed_matches_file(doc: pymupdf.Document, page, box: pymupdf.Rect, path: Path) -> bool:
+    """Decoded pixels of the image placed at ``box`` equal the file's (JPEG decoders may differ by a level)."""
+    import numpy as np
+    from PIL import Image
+
+    from .compare import _image_pixels
+
+    def iou(i) -> float:
+        r = pymupdf.Rect(i["bbox"])
+        return abs(r & box) / (abs(r | box) or 1)
+
+    best = max(page.get_image_info(xrefs=True), key=iou, default=None)  # not e.g. a page background under it
+    if best is None or iou(best) < 0.9:
+        return False
+    if best["xref"] and doc.xref_stream_raw(best["xref"]) == path.read_bytes():
+        return True  # stored as-is (e.g. JPEG pass-through)
+    got = _image_pixels(doc, page, best["xref"], box).astype(np.int16)
+    with Image.open(path) as im:
+        want = np.asarray(im.convert("RGBA" if got.shape[2] == 4 else "RGB")).astype(np.int16)
+    if got.shape != want.shape:
+        return False
+    if got.shape[2] == 4:  # colour under fully transparent pixels is irrelevant: compare premultiplied
+        got = np.dstack([got[..., :3] * got[..., 3:] // 255, got[..., 3]])
+        want = np.dstack([want[..., :3] * want[..., 3:] // 255, want[..., 3]])
+    return float(np.abs(got - want).mean()) < 1.0
 
 
 def _dispatch(ctx: _Ctx, page, op, res: OpResult) -> None:
@@ -889,6 +1005,8 @@ def _dispatch(ctx: _Ctx, page, op, res: OpResult) -> None:
         _redact_op(ctx, page, op, res)
     elif isinstance(op, RemoveImage):
         _remove_image(ctx, page, op, res)
+    elif isinstance(op, InsertImage):
+        _insert_image(ctx, page, op, res)
     elif isinstance(op, ShiftContent):
         _shift_content(ctx, page, op, res)
     else:
@@ -936,6 +1054,7 @@ def apply_edits(
             except Exception as exc:
                 report.warnings.append(f"font subsetting failed, output is larger: {exc}")
         with atomic_output(output) as tmp:
+            # deflate also losslessly compresses images stored uncompressed (pixels unchanged, bytes differ)
             doc.save(tmp, garbage=3, deflate=True)
     finally:
         doc.close()
@@ -943,7 +1062,7 @@ def apply_edits(
     out_doc = open_pdf(output)
     try:
         for op, res in zip(cs.operations, report.results):
-            _verify(out_doc, op, res)
+            _verify(out_doc, op, res, base)
     finally:
         out_doc.close()
     report.output = str(output.resolve())
@@ -954,6 +1073,7 @@ def apply_edits(
             if out != ref:
                 mask["candidate_rect"] = out
             report.masks.append(mask)
+        report.masks += [{**m, "label": f"op {r.index} {r.op}"} for m in r.other_pages]
     for op in cs.operations:  # areas below a shift line sit elsewhere in the output
         if isinstance(op, ShiftContent):
             report.shifts.append({"page": op.page, "y": op.y, "dy": op.dy})

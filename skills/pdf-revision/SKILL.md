@@ -170,6 +170,32 @@ If any operation fails, nothing is written and the JSON report explains why per 
 Check `verified` for every operation: `false` means the new text could not be read back
 (for example, ligatures a font cannot map), which matters for search and ATS parsing.
 
+### 7–8A (images). Update images from the user's prompt and put them back
+
+1. `"$PDF_TOOL" assets /path/original.pdf -o assets` — `manifest.json` lists every image with `id`,
+   `file`, `pages`/`placements`, pixel `width`/`height`, `format`, `has_alpha`, `colorspace`,
+   `effective_dpi` and an inferred `role`. **Open each image file and look at it.**
+2. Map the prompt to concrete images (by role, position, content). Ask if it is ambiguous.
+3. Edit a copy with Python (Pillow / OpenCV / numpy), then look at the result:
+   - start from the exported file and keep its pixel size and aspect ratio unless asked;
+   - keep transparency: work in RGBA and save PNG; save JPEG sources as JPEG (quality 95)
+     unless the edit adds transparency;
+   - doable: recolor (e.g. brand color), brightness/contrast, grayscale/sepia, crop, rotate,
+     remove a flat background, blur/pixelate a region, cover or add text, round corners,
+     composite a file the user provides;
+   - not doable locally: generative changes (new objects, different expression or pose,
+     a new scene). Say so; a replacement file from the user works.
+4. Put it back: `{"op": "replace_image", "page": 1, "asset_id": "img-7", "image": "edited/img-7.png"}`
+   (or `remove_image`). Placement, clipping (e.g. a round photo frame) and every page that
+   shares the image are kept/updated. In the report, `verified: true` means the placed pixels
+   equal your file.
+5. `compare --masks edit-report.json` lists each image as `identical` (same bytes), `same_pixels`
+   (re-encoded), `changed` (with `pixel_diff`, `masked` = intended), `missing` or `added`.
+   `status: ok` means only the intended images changed. Look at the side-by-side images.
+
+In a scaffold (Strategy B) images are files under `rebuild/images/`: edit the file or point the
+`<img src>` to the edited copy. Chromium keeps JPEG bytes as they are and keeps PNG pixels exact.
+
 ### 7–8B. Strategy B: rebuild as HTML/CSS and generate
 
 **Start from the scaffold** — an editable HTML replica of the original:
@@ -253,6 +279,8 @@ blue = masked) for every page and check them yourself. In `comparison/report.jso
 - per page: `changed_regions`, `moved_blocks` (dx/dy/dw/dh in pt), `missing_blocks`,
   `warnings` (text beyond page edge, overlapping text, text outside the reference margins,
   page-size differences, extra/missing pages, nearly empty last page),
+- per page `images`: every image as identical / same_pixels / changed / missing / added
+  (moved and masked flags included),
 - `ssim` / `changed_pixels` — only meaningful outside intentional changes.
 
 Typical fixes (Strategy B): adjust font-size/line-height/letter-spacing to the measured values,

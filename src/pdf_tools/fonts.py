@@ -85,12 +85,25 @@ def split_font_name(name: str) -> tuple[str, bool, bool]:
     return fam, bold, italic
 
 
+SANS_FAMILIES = ("sans", "helvetica", "arial", "swiss", "univers", "frutiger", "futura", "gill", "verdana",
+                 "tahoma", "segoe", "roboto", "lato", "inter", "myriad", "franklin", "avenir", "din", "calibri")
+
+
 def font_class(family: str, serif: bool = False, mono: bool = False) -> str:
+    """Known family names win over the PDF's flags (which are often wrong); 'Roman'
+    and 'Book' are weights, not a serif hint."""
     if mono or any(w in family for w in ("courier", "mono", "consol", "menlo", "code")):
         return "mono"
-    if serif or any(w in family for w in ("times", "serif", "georgia", "garamond", "roman", "book", "minion", "cambria")):
-        return "serif" if "sans" not in family else "sans"
+    if any(w in family for w in SANS_FAMILIES):
+        return "sans"
+    if serif or any(w in family for w in ("times", "serif", "georgia", "garamond", "minion", "cambria", "baskerville")):
+        return "serif"
     return "sans"
+
+
+def is_condensed(name: str) -> bool:
+    n = norm_name(name)
+    return any(w in n for w in ("cond", "narrow", "compressed"))
 
 
 @cache
@@ -170,6 +183,22 @@ def embedded_variant(doc: pymupdf.Document, page: pymupdf.Page, family: str, bol
     return None
 
 
+def _subset_with_glyphs(doc: pymupdf.Document, key: str, text: str):
+    seen: set[int] = set()
+    for page in doc:
+        for k, (xref, ext, buf) in embedded_fonts(doc, page).items():
+            if xref in seen or not (k.startswith(key) or key.startswith(k)) or min(len(k), len(key)) < 12:
+                continue
+            seen.add(xref)
+            try:
+                f = pymupdf.Font(fontbuffer=buf)
+            except Exception:
+                continue
+            if not _missing(f, text):
+                return f, buf, ext
+    return None
+
+
 def resolve_font(
     doc: pymupdf.Document,
     page: pymupdf.Page,
@@ -206,18 +235,30 @@ def resolve_font(
             notes.append(f"no embedded {'bold ' if want_bold else ''}{'italic ' if want_italic else ''}variant of '{original}'")
             original = None
     if original and not family:
-        emb = embedded_fonts(doc, page).get(norm_name(original))
+        fonts_here = embedded_fonts(doc, page)
+        key = norm_name(original)
+        emb = fonts_here.get(key)
+        if emb is None and len(key) >= 12:  # producers truncate names ('...BlackCondense' vs '...BlackCondensed')
+            emb = next((v for k, v in fonts_here.items() if k.startswith(key) or key.startswith(k) and len(k) >= 12), None)
         if emb:
             _, ext, buf = emb
             f = pymupdf.Font(fontbuffer=buf)
             miss = _missing(f, text)
             if not miss:
                 return ResolvedFont(f, original, "original-embedded", want_bold, want_italic, buf, ext)
+            # the same font is often embedded as several subsets: look for one with every glyph
+            other = _subset_with_glyphs(doc, key, text)
+            if other:
+                f, buf, ext = other
+                return ResolvedFont(f, original, "original-embedded", want_bold, want_italic, buf, ext,
+                                    warnings=[f"glyphs taken from another embedded subset of '{original}'"])
             notes.append(f"embedded '{original}' lacks glyphs for {''.join(miss)!r} (subset font or no cmap)")
         else:
             notes.append(f"'{original}' is not embedded or not extractable")
 
     path = system_font(fam, want_bold, want_italic, font_dirs)
+    if path is None and is_condensed(name) and font_class(fam, serif, mono) == "sans":
+        path = system_font("arialnarrow", want_bold, want_italic, font_dirs)  # keeps condensed widths
     if path:
         try:
             f = pymupdf.Font(fontfile=str(path))

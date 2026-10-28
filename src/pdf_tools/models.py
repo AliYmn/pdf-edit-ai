@@ -161,6 +161,9 @@ class Asset(BaseModel):
     font_name: str | None = None
     subset: bool | None = None
     web_usable: bool | None = None
+    has_alpha: bool | None = Field(None, description="Image has transparency (soft mask)")
+    colorspace: str | None = Field(None, description="Image colour space as stored, e.g. DeviceRGB, DeviceCMYK")
+    effective_dpi: float | None = Field(None, description="Lowest pixels-per-inch over its placements")
     notes: list[str] = []
 
 

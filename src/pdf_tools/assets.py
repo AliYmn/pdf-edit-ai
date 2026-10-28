@@ -79,12 +79,14 @@ def export_images(doc: pymupdf.Document, out: Path, min_size: int, warnings: lis
             else:
                 xref = int(aid.split("-")[1])
                 data, ext, w, h = _image_bytes(doc, xref)
+                raw = doc.extract_image(xref) or {}
                 notes = []
         except Exception as exc:
             warnings.append(f"{aid}: could not export image ({exc})")
             continue
         if w < min_size or h < min_size:
             continue
+        dpi = min(w / (pymupdf.Rect(p.bbox).width / 72) for p in places if pymupdf.Rect(p.bbox).width > 0)
         file = out / "images" / f"{aid}.{ext}"
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_bytes(data)
@@ -101,6 +103,9 @@ def export_images(doc: pymupdf.Document, out: Path, min_size: int, warnings: lis
                 role=_role(places, doc),
                 sha256=_sha(data),
                 xref=xref,
+                has_alpha=bool(raw.get("smask")) if xref else False,
+                colorspace=(raw.get("cs-name") or None) if xref else "DeviceRGB",
+                effective_dpi=round(dpi, 1),
                 notes=notes,
             )
         )

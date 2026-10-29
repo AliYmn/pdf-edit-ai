@@ -297,3 +297,20 @@ def test_bold_run_uses_embedded_sibling_font(tmp_path):
     rep = edit(src, tmp_path, [{"op": "replace_text", "page": 1, "search": "Django", "runs": [{"text": "Django", "bold": True}]}])
     assert rep.ok and rep.results[0].font_source == "original-embedded"
     assert is_bold(spans_with(tmp_path / "out.pdf", "Django")[0])
+
+
+def test_inserted_text_extracts_plain_spaces_hyphens_and_semicolons(pdfs, tmp_path):
+    # macOS Arial maps U+00A0/U+00AD/U+037E onto the space/hyphen/semicolon glyphs
+    arial = "/System/Library/Fonts/Supplemental/Arial.ttf"
+    if not __import__("os").path.exists(arial):
+        pytest.skip("system Arial not available")
+    text = "Cycle use: 14.4-14.7 V DC; standby use: 13.5-13.8 V DC; initial current limit 2.15 A. " * 3
+    rep = edit(pdfs["multipage"], tmp_path, [
+        {"op": "insert_text", "page": 1, "rect": [72, 400, 400, 480], "text": text.strip(), "font_file": arial,
+         "size": 10, "line_height": 12, "align": "justify"},
+    ])  # fmt: skip
+    assert rep.ok
+    with pymupdf.open(tmp_path / "out.pdf") as doc:
+        raw = doc[0].get_text("text", clip=pymupdf.Rect(70, 395, 405, 485))
+    assert not set(raw) & {"\xa0", "\xad", "\u037e"}
+    assert " ".join(raw.split()) == " ".join(text.split())

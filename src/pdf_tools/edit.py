@@ -544,7 +544,7 @@ def _write_placements(page, placements: list[Placement], fonts: _Fonts, scale: f
     area = pymupdf.Rect()
     tw, color = None, None
     for pl in placements:
-        if not pl.text.strip():
+        if not pl.text:  # spaces are written too; justified lines position them individually
             continue
         bw = fonts.embolden.get(pl.style)
         if bw:  # fill + stroke text (TextWriter cannot stroke)
@@ -1192,6 +1192,51 @@ def _placed_matches_file(doc: pymupdf.Document, page, box: pymupdf.Rect, path: P
     return float(np.abs(got - want).mean()) < 1.0
 
 
+def _fix_unicode_aliases(doc) -> int:
+    """Some system faces give several code points the same glyph (Arial: U+00A0 for the
+    space, U+00AD for the hyphen, U+037E for the semicolon). PyMuPDF then records that
+    alias in the ToUnicode CMap, so copying or searching the output yields the wrong
+    character. Map each alias back to the plain character, but only in fonts that have
+    no mapping for the plain character (a real NBSP/soft hyphen is therefore kept)."""
+    aliases = {0xA0: 0x20, 0xAD: 0x2D, 0x37E: 0x3B}
+    line_re = re.compile(r"^<([0-9a-fA-F]{4})>\s*(?:<([0-9a-fA-F]{4})>\s*)?<([0-9a-fA-F]{4})>\s*$")
+    fixed = 0
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+            m = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", obj)
+            cmap = doc.xref_stream(int(m.group(1))) if m else None
+        except Exception:
+            continue
+        if not cmap or b"begincmap" not in cmap:
+            continue
+        text = cmap.decode("latin-1")
+        mapped: set[int] = set()
+        for line in text.splitlines():
+            mm = line_re.match(line.strip())
+            if not mm:
+                continue
+            lo, hi, dst = mm.group(1), mm.group(2), mm.group(3)
+            base = int(dst, 16)
+            mapped |= {base + k for k in range(int(hi, 16) - int(lo, 16) + 1)} if hi else {base}
+        out = []
+        changed = False
+        for line in text.splitlines():
+            mm = line_re.match(line.strip())
+            if mm:
+                lo, hi, dst = mm.group(1), mm.group(2), mm.group(3)
+                want = aliases.get(int(dst, 16))
+                if want is not None and want not in mapped:
+                    cut = line.rfind(dst)
+                    line = line[:cut] + f"{want:04x}" + line[cut + len(dst):]
+                    changed = True
+            out.append(line)
+        if changed:
+            doc.update_stream(int(m.group(1)), "\n".join(out).encode("latin-1"))
+            fixed += 1
+    return fixed
+
+
 def _dispatch(ctx: _Ctx, page, op, res: OpResult) -> None:
     if isinstance(op, ReplaceText):
         (_replace_inline if op.search is not None else _replace_rect)(ctx, page, op, res)
@@ -1257,6 +1302,10 @@ def apply_edits(
                 doc.subset_fonts()
             except Exception as exc:
                 report.warnings.append(f"font subsetting failed, output is larger: {exc}")
+            try:
+                _fix_unicode_aliases(doc)
+            except Exception as exc:  # never fail an edit over a ToUnicode touch-up
+                report.warnings.append(f"ToUnicode alias fix skipped: {exc}")
         with atomic_output(output) as tmp:
             # deflate also losslessly compresses images stored uncompressed (pixels unchanged, bytes differ)
             doc.save(tmp, garbage=3, deflate=True)

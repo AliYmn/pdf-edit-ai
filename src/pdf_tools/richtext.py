@@ -215,11 +215,8 @@ def layout(
             extra = (avail - line_w) / gaps
             x = x0
             for (t, s), w in zip(toks, widths):
-                if t.isspace():
-                    x += w + extra
-                else:
-                    out.append(Placement(x, y, t, s))
-                    x += w
+                out.append(Placement(x, y, t, s))  # spaces too, so extracted text keeps its word gaps
+                x += w + extra if t.isspace() else w
             continue
         x = x0 + {"right": avail - line_w, "center": (avail - line_w) / 2}.get(align, 0.0)
         for (t, s), w in zip(toks, widths):  # merge same-style neighbours, spaces included

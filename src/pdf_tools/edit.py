@@ -35,6 +35,7 @@ from .richtext import Piece, Placement, Style, build_pieces, describe, layout, p
 from .models import BBox
 
 RAW_FLAGS = pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES & ~pymupdf.TEXT_PRESERVE_LIGATURES
+LIGATURES = {"\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl", "\ufb05": "st", "\ufb06": "st"}
 BASELINE_RATIO = 0.8  # first baseline sits 0.8em below the top of a CSS-like line box
 Overflow = Literal["error", "shrink", "allow"]
 
@@ -196,13 +197,17 @@ class PrintItem(BaseModel):
     text: str | None = Field(None, description="New text (needs 'old')")
     old: str | None = Field(None, description="The printed text being replaced, for its letter metrics")
     logo: str | None = Field(None, description="Image whose alpha is the new mark, tinted with the ink colour")
-    ink: Literal["light", "dark"] = "light"
+    ink: Literal["light", "dark", "auto"] = Field("light", description="light/dark ink, or auto: anything unlike the surface (multi-coloured marks)")
     mode: Literal["shear", "rotate"] = Field("shear", description="shear: print seen in perspective; rotate: printed at an angle")
     clip: list[tuple[float, float]] | None = Field(None, description="Visible area, e.g. not behind a cutaway")
     grow: float = Field(1.0, ge=0.5, le=2.0, description="Widen the box for small blurry print")
     stroke: int = Field(0, ge=0, le=30, description="Extra text weight")
     min_aspect: float | None = Field(None, gt=0, description="Extend a partly hidden mark to this width/height")
     font_file: str | None = None
+    color: str | None = Field(None, pattern=r"^#[0-9a-fA-F]{6}$", description="Ink of the new mark, e.g. a brand colour (default: the measured ink)")
+    refill: Literal["inpaint", "surface"] = Field("inpaint", description="surface: refill only from pixels that look like the surrounding surface (flat labels with print nearby)")
+    threshold: float | None = Field(None, gt=0, le=255, description="auto ink: colour distance from the surrounding surface that counts as ink (default: measured)")
+    fit: Literal["stretch", "contain"] = Field("stretch", description="logo: stretch to the old mark's box, or contain (keep proportions)")
 
     @model_validator(mode="after")
     def _check(self):
@@ -335,6 +340,21 @@ def _union(rects) -> pymupdf.Rect:
     return out
 
 
+def _core_rects(chars) -> list[pymupdf.Rect]:
+    """The central part of each glyph box. Glyph boxes of neighbours often overlap (a period's
+    advance reaches into the next letter), and redacting full boxes would delete those
+    neighbours too."""
+    out = []
+    for c in chars:
+        r = pymupdf.Rect(c["bbox"])
+        if r.is_empty:
+            continue
+        cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+        dx, dy = r.width * 0.25, r.height * 0.2
+        out.append(pymupdf.Rect(cx - dx, cy - dy, cx + dx, cy + dy))
+    return out
+
+
 def _redact(page: pymupdf.Page, rects, fill: str | None = None, images: bool = False, graphics: bool = False) -> None:
     for r in rects:
         page.add_redact_annot(pymupdf.Rect(r), fill=_rgb(fill) if fill else False, cross_out=False)
@@ -370,7 +390,7 @@ def logical_lines(page: pymupdf.Page) -> list[dict]:
             chars = [(c, s) for s in line["spans"] for c in s["chars"]]
             if chars:
                 r = pymupdf.Rect(line["bbox"])
-                items.append({"block": block, "bbox": r, "rects": [r], "chars": chars,
+                items.append({"block": block, "bbox": r, "rects": [r], "chars": chars, "dir": tuple(line["dir"]),
                               "y": chars[0][0]["origin"][1], "size": chars[0][1]["size"]})  # fmt: skip
     items.sort(key=lambda it: it["y"])
     rows: list[list[dict]] = []
@@ -407,13 +427,18 @@ def _fold(ch: str) -> str:
     return low if len(low) == 1 else ch  # keep 1:1 positions (e.g. Turkish 'İ' lowers to two code points)
 
 
-def find_line_hits(page: pymupdf.Page, needle: str, ignore_case: bool = False) -> list[_Hit]:
-    """Whitespace-insensitive search within visual lines, keeping per-character geometry."""
+def find_line_hits(page: pymupdf.Page, needle: str, ignore_case: bool = False, rotated: bool = False) -> list[_Hit]:
+    """Whitespace-insensitive search within visual lines, keeping per-character geometry.
+
+    Rotated lines are left out (the line re-setting works on horizontal baselines only);
+    ``rotated=True`` returns only the hits on rotated lines instead."""
     target = _norm_ws(needle)
     if ignore_case:
         target = "".join(_fold(c) for c in target)
     hits = []
     for line in logical_lines(page):
+        if (abs(line["dir"][1]) > 1e-3 or line["dir"][0] < 0) != rotated:
+            continue
         chars = line["chars"]
         norm, idx = [], []
         for k, (c, _) in enumerate(chars):
@@ -522,8 +547,10 @@ class _Fonts:
                 )  # fmt: skip
                 self.cache[st] = rf
                 self.res.warnings += [w for w in rf.warnings if w not in self.res.warnings]
-                heavy = st.font and any(w in st.font.lower() for w in ("black", "heavy", "ultra", "extrabold"))
-                if heavy and rf.source != "original-embedded" and rf.buffer:
+                weights = ("black", "heavy", "ultra", "extrabold")
+                heavy = st.font and any(w in st.font.lower() for w in weights)
+                already_heavy = any(w in (rf.label or "").lower().replace(" ", "") for w in weights)
+                if heavy and rf.source not in ("original-embedded", "font_file") and not already_heavy and rf.buffer:
                     # a black/heavy face replaced by a lighter bold: thicken it (measured ink density match)
                     self.embolden[st] = 0.04
                     self.res.warnings.append(f"'{st.font}' substituted by {rf.label}, emboldened to match its weight")
@@ -687,7 +714,7 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
             elif shift_post and h.end < len(h.chars):
                 moved.append((h.end, len(h.chars), [shift_post] * (len(h.chars) - h.end)))
         redact_idx = [(h.start, h.end)] + [(a, b) for a, b, _ in moved]
-        rects = [_union(c["bbox"] for c, _ in h.chars[a:b]) for a, b in redact_idx]
+        rects = [r for a, b in redact_idx for r in _core_rects(c for c, _ in h.chars[a:b])]
         y = h.chars[h.start][0]["origin"][1]
         _redact(page, rects, op.fill)
         x = h.chars[h.start][0]["origin"][0] + shift_pre
@@ -717,10 +744,33 @@ def _replace_inline(ctx: _Ctx, page, op: ReplaceText, res: OpResult) -> None:
                     # letter by letter at the original positions: keeps the producer's tracking/kerning
                     tw = pymupdf.TextWriter(page.rect)
                     keep_spaces = seg_font.font.has_glyph(32)  # word gaps stay real spaces for search/extraction
-                    for c, _ in h.chars[k:j]:
-                        if not c["c"].isspace() or (c["c"] == " " and keep_spaces):
-                            rect, _ = tw.append((c["origin"][0] + shift, c["origin"][1]), c["c"], font=seg_font.font, fontsize=st["size"])
+                    seg_chars = [c for c, _ in h.chars[k:j]]
+                    lig_end, n = -1e9, 0
+                    while n < len(seg_chars):
+                        c = seg_chars[n]
+                        x, ch = c["origin"][0] + shift, c["c"]
+                        if ch.isspace() and c["bbox"][0] < lig_end - 0.1:
+                            n += 1
+                            continue  # a producer's placeholder inside a ligature glyph, not a word gap
+                        # a ligature: one glyph that extraction splits into a full-width letter followed by
+                        # zero-width ones ('f' + 'i'), or a single ligature code point; write plain letters
+                        group = [ch]
+                        while n + len(group) < len(seg_chars):
+                            nxt = seg_chars[n + len(group)]
+                            if nxt["c"].isspace() or nxt["bbox"][2] - nxt["bbox"][0] > 0.01:
+                                break
+                            group.append(nxt["c"])
+                        letters = "".join(LIGATURES.get(g, g) for g in group)
+                        if len(letters) > 1:
+                            lig_end = c["bbox"][2]
+                            for letter in letters:
+                                rect, _ = tw.append((x, c["origin"][1]), letter, font=seg_font.font, fontsize=st["size"])
+                                written |= rect
+                                x += seg_font.font.text_length(letter, st["size"])
+                        elif not ch.isspace() or (ch == " " and keep_spaces):
+                            rect, _ = tw.append((x, c["origin"][1]), ch, font=seg_font.font, fontsize=st["size"])
                             written |= rect
+                        n += len(group)
                     tw.write_text(page, color=_rgb(st["color"]))
                 k = j
         res.rects.append(rnd(_union(rects) | written))
@@ -736,19 +786,30 @@ def _replace_rect(ctx: _Ctx, page, op: ReplaceText | InsertText, res: OpResult) 
         raise PdfToolError("rect is empty or outside the page")
     old: list[Piece] = []
     spans, line_rects, baselines = [], [], []
+    pieces_found = []  # (baseline, x0, spans, rect): text objects in content-stream order
     for b in page.get_text("dict", flags=RAW_FLAGS)["blocks"]:
         if b["type"] != 0:
             continue
         for ln in b["lines"]:
             inside = [s for s in ln["spans"] if s["text"].strip() and pymupdf.Rect(s["bbox"]) in box + (-1, -1, 1, 1)]
-            if not inside:
-                continue
-            if old:
+            if inside:
+                pieces_found.append((inside[0]["origin"][1], inside[0]["bbox"][0], inside, pymupdf.Rect(ln["bbox"])))
+    # reading order: earlier edits append re-set text at the end of the content stream, so sort
+    # by baseline, and join the pieces of one visual line
+    pieces_found.sort(key=lambda it: (it[0], it[1]))
+    for y, _, inside, rect in pieces_found:
+        same_line = baselines and abs(y - baselines[-1]) < 0.5
+        if old:
+            prev, nxt = old[-1][0], inside[0]["text"]
+            if not same_line or not (prev[-1:].isspace() or nxt[:1].isspace()):
                 old.append((" ", old[-1][1]))  # line break inside a paragraph = space
-            old += [(s["text"], _style_of(s)) for s in inside]
-            spans += inside
-            line_rects.append(pymupdf.Rect(ln["bbox"]))
-            baselines.append(inside[0]["origin"][1])
+        old += [(s["text"], _style_of(s)) for s in inside]
+        spans += inside
+        if same_line:
+            line_rects[-1] |= rect
+        else:
+            line_rects.append(rect)
+            baselines.append(y)
     is_replace = isinstance(op, ReplaceText)
     if is_replace and not spans:
         res.warnings.append("no existing text found inside rect; text inserted with default style")
@@ -851,7 +912,7 @@ def _redact_op(ctx: _Ctx, page, op: Redact, res: OpResult) -> None:
     if op.rect is not None:
         rects = [pymupdf.Rect(op.rect) & page.rect]
     else:
-        hits = find_line_hits(page, op.search)
+        hits = find_line_hits(page, op.search) + find_line_hits(page, op.search, rotated=True)
         rects = [h.rect for h in hits] or page.search_for(op.search)  # search_for also spans line breaks
         rects = _select(rects, op.occurrence, f"search text {op.search!r}")
     _redact(page, rects, op.fill, op.remove_images, op.remove_graphics)
@@ -875,7 +936,7 @@ def _replace_image(ctx: _Ctx, page, op: ReplaceImage, res: OpResult) -> None:
     infos = page.get_image_info(xrefs=True)
     if op.rect is not None:
         target = pymupdf.Rect(op.rect)
-        scored = [(abs(pymupdf.Rect(i["bbox"]) & target), i) for i in infos]
+        scored = [(_match_score(i["bbox"], target), i) for i in infos]
         scored = [s for s in scored if s[0] > 0]
         if not scored:
             raise PdfToolError("no image overlaps rect")
@@ -933,11 +994,19 @@ def _insert_image(ctx: _Ctx, page, op: InsertImage, res: OpResult) -> None:
     res.rects.append(rnd(box))
 
 
+def _match_score(bbox, target: pymupdf.Rect) -> float:
+    """Overlap relative to the union, so a full-page background never beats the image
+    whose placement matches the rect."""
+    r = pymupdf.Rect(bbox)
+    inter = abs(r & target)
+    return inter / (abs(r) + abs(target) - inter) if inter > 0 else 0.0
+
+
 def _image_xref(ctx: _Ctx, page, op) -> tuple[int, list]:
     """xref and all placements (page, rect) of the image an op points at."""
     if op.rect is not None:
         target = pymupdf.Rect(op.rect)
-        scored = [(abs(pymupdf.Rect(i["bbox"]) & target), i) for i in page.get_image_info(xrefs=True)]
+        scored = [(_match_score(i["bbox"], target), i) for i in page.get_image_info(xrefs=True)]
         scored = [s for s in scored if s[0] > 0]
         if not scored:
             raise PdfToolError("no image overlaps rect")
@@ -977,7 +1046,8 @@ def _swap_print(ctx: _Ctx, page, op: SwapPrint, res: OpResult) -> None:
     ctx.files[res.index] = path
     res.rects += [rnd(b) for p, b in placements if p.number == page.number]
     res.other_pages += [{"page": p.number + 1, "rect": rnd(b)} for p, b in placements if p.number != page.number]
-    res.message = "; ".join(f"angle {i['angle']}°, box {i['size']}, ink {i['ink_color']}" for i in infos)
+    res.message = "; ".join(f"angle {i['angle']}°, box {i['size']}, ink {i['ink_color']}"
+        + (f" -> {i['new_color']}" if i["new_color"] != i["ink_color"] else "") for i in infos)
 
 
 def _case_like(matched: str, new: str) -> str:
@@ -1018,6 +1088,9 @@ def _replace_all(ctx: _Ctx, op: ReplaceAll, res: OpResult) -> None:
             per_page[i + 1] = per_page.get(i + 1, 0) + 1
         else:
             raise PdfToolError(f"page {i + 1}: too many matches")
+        skipped = len(find_line_hits(page, op.search, ignore_case=not op.match_case, rotated=True))
+        if skipped:
+            res.warnings.append(f"page {i + 1}: {skipped} match(es) on rotated text left unchanged")
     total = sum(per_page.values())
     res.message = f"replaced {total} occurrence(s): " + ", ".join(f"p{p}: {n}" for p, n in per_page.items())
     if not total:
